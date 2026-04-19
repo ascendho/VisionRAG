@@ -17,8 +17,38 @@ class ChatRequest(BaseModel):
     chat_history: Optional[List[dict]] = None
     top_k: int = 3
 
+@router.get("/files")
+def list_files():
+    """
+    Returns a list of all uniquely uploaded documents in the vector store.
+    """
+    from backend.app.main import vector_store_instance
+    if vector_store_instance is None:
+        raise HTTPException(status_code=500, detail="Qdrant backend is not ready")
+
+    try:
+        files = vector_store_instance.get_all_documents()
+        return {"status": "success", "files": files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/files/{document_id}")
+def delete_file(document_id: str):
+    """
+    Deletes a document from the vector store by its ID.
+    """
+    from backend.app.main import vector_store_instance
+    if vector_store_instance is None:
+        raise HTTPException(status_code=500, detail="Qdrant backend is not ready")
+        
+    try:
+        vector_store_instance.delete_document(document_id)
+        return {"status": "success", "message": f"Document {document_id} deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+def upload_pdf(file: UploadFile = File(...)):
     """
     接收 PDF 并处理为其页面缓存与特征。
     """
@@ -75,7 +105,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             os.remove(temp_path)
 
 @router.post("/chat")
-async def chat(req: ChatRequest):
+def chat(req: ChatRequest):
     """
     接收对某几篇（或全部）文档的查询，
     进行两阶段召回后使用豆包生成答案，返回文字回答以及匹配到的页面图片（供溯源）。

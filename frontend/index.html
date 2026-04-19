@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>VisionRAG - Gemini Style</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%231a73e8'%3E%3Cpath d='M12 2l2.5 7.5H22l-6 4.5 2.5 7.5L12 17l-6 4.5 2.5-7.5L2 9.5h7.5L12 2z'/%3E%3C/svg%3E">
   <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
@@ -17,22 +18,22 @@
     .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
     .welcome-card {
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      border-radius: 1rem;
-      background: linear-gradient(145deg, #f8fafc 0%, #f0f4f9 100%);
+      transition: all 0.2s ease-in-out;
+      border-radius: 16px;
+      background: #ffffff;
       padding: 1.25rem;
       display: flex;
       flex-direction: column;
-      justify-content: space-between;
-      min-height: 110px;
-      border: 1px solid rgba(26, 115, 232, 0.08);
-      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+      gap: 12px;
+      min-height: 130px;
+      border: 1px solid #e2e8f0;
+      cursor: pointer;
     }
     .welcome-card:hover {
-      background: linear-gradient(145deg, #ffffff 0%, #f5f9ff 100%);
-      border-color: rgba(26, 115, 232, 0.2);
-      box-shadow: 0 10px 20px -3px rgba(26, 115, 232, 0.15), 0 4px 6px -2px rgba(26, 115, 232, 0.08);
+      background: #f8fafc;
+      border-color: #cbd5e1;
       transform: translateY(-2px);
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
     }
 
     /* Hide scrollbar for clean look */
@@ -57,35 +58,41 @@
   <!-- Main Chat Area -->
   <main class="flex-1 flex flex-col h-full relative">
     <header class="flex justify-between items-center px-4 md:px-8 py-4 h-[64px]">
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 cursor-pointer transition-transform hover:scale-[1.02]" onclick="resetUI()">
         <span class="text-xl text-[#444746] font-medium tracking-tight">Vision RAG</span>
         <div class="flex w-6 h-6 items-center justify-center rounded bg-blue-100/50">
           <svg class="w-4 h-4 text-[#1a73e8]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 7.5H22l-6 4.5 2.5 7.5L12 17l-6 4.5 2.5-7.5L2 9.5h7.5L12 2z"/></svg>
         </div>
       </div>
       
+      <button onclick="openFilesModal()" class="flex items-center gap-2.5 px-4 py-2.5 text-[17px] font-bold text-[#444746] hover:bg-[#e8f0fe] hover:text-[#1a73e8] rounded-xl transition-colors group">
+        <svg class="w-[22px] h-[22px] text-[#1a73e8] group-hover:text-[#174ea6]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+        <span class="mt-[-1px]">已加载文档</span>
+      </button>
     </header>
 
     <div class="flex-1 overflow-y-auto px-4 md:px-[10%] lg:px-[15%] xl:px-[20%] pb-36 pt-6" id="messagesContainer">
       <!-- Welcome Screen -->
-      <div id="welcomeScreen" class="h-full flex flex-col justify-center max-w-3xl mx-auto w-full mt-[-8vh]">
-        <div class="mb-12">
+      <div id="welcomeScreen" class="h-full flex flex-col justify-center items-center text-center max-w-3xl mx-auto w-full mt-[-8vh]">
+        <div class="mb-12 flex flex-col items-center">
+          <div class="mb-6 mb-2">
+            <svg class="w-14 h-14" fill="url(#sparkle-grad)" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="sparkle-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stop-color="#4285f4" />
+                  <stop offset="50%" stop-color="#9b72cb" />
+                  <stop offset="100%" stop-color="#d96570" />
+                </linearGradient>
+              </defs>
+              <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+            </svg>
+          </div>
           <h1 class="text-[40px] md:text-[56px] font-semibold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-blue-500 via-purple-500 to-rose-400 mb-2 leading-tight">
             你好
           </h1>
-          <p class="text-3xl md:text-4xl text-[#c4c7c5] font-medium tracking-tight">
+          <p class="text-3xl md:text-3xl text-[#c4c7c5] font-medium tracking-tight mt-2">
             上传 PDF 开启多模态视觉检索
           </p>
-        </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-8 max-w-3xl">
-          <div class="welcome-card text-[#444746] cursor-pointer">
-            <p class="text-sm">在图表和复杂图片中精准搜索信息</p>
-            <svg class="w-5 h-5 self-end text-zinc-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"></path><path d="M21 17v-6h-6"></path><circle cx="12" cy="12" r="1"></circle><path d="M9 12a3 3 0 1 0 6 0 3 3 0 0 0-6 0"></path></svg>
-          </div>
-          <div class="welcome-card text-[#444746] cursor-pointer">
-            <p class="text-sm">支持多文件全局智能检索，无缝对话</p>
-            <svg class="w-5 h-5 self-end text-zinc-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 7.5H22l-6 4.5 2.5 7.5L12 17l-6 4.5 2.5-7.5L2 9.5h7.5L12 2z"/></svg>
-          </div>
         </div>
       </div>
       
@@ -96,7 +103,7 @@
     </div>
 
     <!-- Input Bar -->
-    <div class="absolute bottom-0 left-0 right-0 p-4 md:px-[10%] lg:px-[15%] xl:px-[20%] md:pb-8 bg-gradient-to-t from-white via-white to-transparent pt-10">
+    <div id="inputContainer" class="absolute bottom-0 left-0 right-0 p-4 md:px-[10%] lg:px-[15%] xl:px-[20%] md:pb-8 bg-gradient-to-t from-white via-white to-transparent pt-10 transform transition-transform duration-700 ease-[cubic-bezier(0.2,1,0.2,1)] -translate-y-[25vh] md:-translate-y-[35vh]">
       <div class="max-w-3xl mx-auto">
         <div class="relative bg-[#f0f4f9] rounded-2xl md:rounded-full flex items-center px-4 py-[6px] shadow-sm transform transition-all group focus-within:shadow-md focus-within:bg-white focus-within:ring-1 focus-within:ring-[#e8eef6]">
           
@@ -112,8 +119,8 @@
             class="flex-1 bg-transparent border-none focus:outline-none text-[#1f1f1f] px-1 py-3 text-[15px] placeholder:text-[#444746]/70 leading-normal"
           />
           
-          <button id="sendBtn" class="p-2.5 text-white rounded-full shrink-0 ml-2 disabled:opacity-50" style="background: linear-gradient(90deg, #1a73e8, #4285f4)">
-            <svg class="w-[18px] h-[18px] transform -rotate-45 ml-1 mt-[-2px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"></path><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+          <button id="sendBtn" class="p-2.5 text-white rounded-full shrink-0 flex items-center justify-center bg-gradient-to-r from-blue-500 to-blue-600 disabled:opacity-50">
+            <svg class="w-5 h-5 mx-auto" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
           </button>
         </div>
         <div class="text-center mt-3 text-[11px] text-[#444746] font-medium tracking-wide">
@@ -132,6 +139,24 @@
       </button>
     </div>
   </div>
+
+  <!-- Files Modal -->
+  <div id="filesModal" class="fixed inset-0 z-40 bg-black/20 hidden items-center justify-center p-4 backdrop-blur-sm transition-opacity opacity-0" onclick="closeFilesModal()">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden transform transition-all scale-95 opacity-0" id="filesModalContent" onclick="event.stopPropagation()">
+      <div class="px-6 py-4 border-b border-gray-100 flex justify-between items-center">
+        <h3 class="text-lg font-semibold text-[#1f1f1f]">已加载文档</h3>
+        <button class="p-1 hover:bg-gray-100 rounded-full text-gray-500 transition-colors" onclick="closeFilesModal()">
+          <svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div class="p-6 max-h-[60vh] overflow-y-auto" id="filesList">
+        <div class="flex justify-center py-4">
+          <div class="w-5 h-5 border-2 border-[#1a73e8] border-t-transparent rounded-full animate-spin"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
 // Core State
     let uploadedDocs = [];
@@ -142,6 +167,7 @@
     const bottomFileInput = document.getElementById('bottomFileInput');
     const queryInput = document.getElementById('queryInput');
     const sendBtn = document.getElementById('sendBtn');
+    const inputContainer = document.getElementById('inputContainer');
     
     const welcomeScreen = document.getElementById('welcomeScreen');
     const chatHistory = document.getElementById('chatHistory');
@@ -166,28 +192,118 @@
       }, 300);
     }
     
+    async function openFilesModal() {
+      const modal = document.getElementById('filesModal');
+      const content = document.getElementById('filesModalContent');
+      const list = document.getElementById('filesList');
+      
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+      
+      list.innerHTML = `<div class="flex justify-center py-6">
+        <div class="w-6 h-6 border-2 border-[#1a73e8] border-t-transparent rounded-full animate-spin"></div>
+      </div>`;
+      
+      // Delay classes for transition
+      setTimeout(() => {
+        modal.classList.remove('opacity-0');
+        content.classList.remove('scale-95', 'opacity-0');
+      }, 10);
+      
+      try {
+        const res = await fetch('/api/rag/files');
+        const data = await res.json();
+        
+        if (data.files && data.files.length > 0) {
+          list.innerHTML = `<div class="space-y-3">
+            ${data.files.map(f => `
+              <div class="flex items-center justify-between p-4 rounded-3xl bg-[#f8f9fa] transition-colors">
+                <div class="flex items-center gap-4 min-w-0 flex-1">
+                  <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center shrink-0 border border-blue-100">
+                    <svg class="w-6 h-6 text-[#1a73e8]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+                  </div>
+                  <div class="min-w-0 flex-1">
+                    <h4 class="text-[16px] font-semibold text-[#1f1f1f] truncate" title="${f.document_name}">${f.document_name}</h4>
+                    <p class="text-[13px] text-[#80868b] mt-0.5">${f.page_count} pages • Indexed</p>
+                  </div>
+                </div>
+                <button id="del-btn-${f.document_id}" onclick="deleteDocument('${f.document_id}')" title="删除文件" class="p-2 ml-4 hover:bg-red-50 rounded-full text-[#80868b] hover:text-[#d93025] transition-colors shrink-0">
+                  <svg class="w-[20px] h-[20px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path></svg>
+                </button>
+              </div>
+            `).join('')}
+          </div>`;
+        } else {
+          list.innerHTML = `<div class="text-center py-8 text-[#80868b]">
+            <svg class="w-12 h-12 mx-auto text-gray-300 mb-3" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
+            <p class="text-sm font-medium text-[#444746]">还没上传文件</p>
+            <p class="text-xs mt-1">请上传 PDF 开始使用</p>
+          </div>`;
+        }
+      } catch (err) {
+        list.innerHTML = `<div class="text-center py-6 text-red-500 text-sm">加载失败: 网络错误</div>`;
+      }
+    }
+    
+    async function deleteDocument(docId) {
+      const btn = document.getElementById('del-btn-' + docId);
+      if (btn) btn.innerHTML = `<div class="w-4 h-4 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>`;
+      try {
+        const res = await fetch('/api/rag/files/' + docId, { method: 'DELETE' });
+        if (res.ok) {
+          openFilesModal(); // re-fetch and render
+        } else {
+          alert('删除失败');
+        }
+      } catch(err) {
+        alert('网络错误');
+      }
+    }
+
+    function closeFilesModal() {
+      const modal = document.getElementById('filesModal');
+      const content = document.getElementById('filesModalContent');
+      modal.classList.add('opacity-0');
+      content.classList.add('scale-95', 'opacity-0');
+      setTimeout(() => {
+        modal.classList.add('hidden');
+        modal.classList.remove('flex');
+      }, 300);
+    }
+    
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeImageModal();
+      if (e.key === 'Escape') {
+        closeImageModal();
+        closeFilesModal();
+      }
     });
 
     // Handle Uploads
     function showUploadingAnimation(text) {
       welcomeScreen.classList.add("hidden");
       chatHistory.classList.remove("hidden");
+      inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[35vh]");
       
       const id = 'load-' + Date.now();
       chatHistory.innerHTML += `
         <div id="${id}" class="flex gap-4 flex-row">
-          <div class="w-8 h-8 rounded-full bg-[#1a73e8]/10 flex items-center justify-center shrink-0 mt-1 relative overflow-hidden">
-            <div class="absolute inset-0 bg-gradient-to-tr from-blue-600 to-purple-500 animate-[spin_2s_linear_infinite]"></div>
-            <div class="absolute inset-[2px] bg-white rounded-full flex items-center justify-center">
-               <svg class="w-3.5 h-3.5 text-[#1a73e8]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 7.5H22l-6 4.5 2.5 7.5L12 17l-6 4.5 2.5-7.5L2 9.5h7.5L12 2z"/></svg>
-            </div>
+          <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
+            <svg class="w-6 h-6 outline-none" fill="url(#sparkle-loading-grad1)" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="sparkle-loading-grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stop-color="#4285f4" />
+                  <stop offset="50%" stop-color="#9b72cb" />
+                  <stop offset="100%" stop-color="#d96570" />
+                </linearGradient>
+              </defs>
+              <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+            </svg>
           </div>
-          <div class="flex flex-col gap-3 items-start">
-            <div class="px-5 py-3.5 text-[15px] leading-relaxed text-[#444746] rounded-3xl bg-[#f0f4f9]/50 animate-pulse">
-              ${text}
-            </div>
+          <div class="px-5 flex items-center justify-center gap-1.5 h-[32px] mt-1 relative">
+            <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.3s"></div>
+            <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.15s"></div>
+            <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce"></div>
+            <span class="ml-3 text-[14px] font-medium text-[#444746]">正在提取与建立索引...</span>
           </div>
         </div>
       `;
@@ -234,6 +350,7 @@ scrollToBottom();
       // Hide welcome, show chat
       welcomeScreen.classList.add("hidden");
       chatHistory.classList.remove("hidden");
+      inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[35vh]");
 
       addUserMessage(text);
       queryInput.value = "";
@@ -266,8 +383,22 @@ scrollToBottom();
 
     sendBtn.addEventListener('click', handleChat);
     queryInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') handleChat();
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleChat();
+      }
     });
+
+    function resetUI() {
+      welcomeScreen.classList.remove("hidden");
+      chatHistory.classList.add("hidden");
+      inputContainer.classList.add("-translate-y-[25vh]", "md:-translate-y-[35vh]");
+      
+      queryInput.value = "";
+      isChatting = false;
+      isUploading = false;
+    }
 
     // UI Helpers
     function scrollToBottom() {
@@ -275,12 +406,26 @@ scrollToBottom();
     }
 
     function addUserMessage(text) {
+      const escapedText = text.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');
       chatHistory.innerHTML += `
-        <div class="flex gap-4 flex-row-reverse">
-          <div class="w-8 h-8 rounded-full bg-emerald-700 flex items-center justify-center shrink-0 mt-1 text-white text-sm font-bold">M</div>
-          <div class="flex flex-col gap-3 items-end max-w-[80%]">
+        <div class="flex gap-4 flex-row-reverse group">
+          <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1 overflow-hidden" style="background: linear-gradient(135deg, #4285f4 0%, #9b72cb 100%)">
+            <svg class="w-[20px] h-[20px] text-white mt-1.5" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
+            </svg>
+          </div>
+          <div class="flex flex-col gap-1 items-end max-w-[80%]">
             <div class="px-5 py-3.5 text-[15px] leading-relaxed bg-[#f0f4f9] text-[#1f1f1f] rounded-3xl rounded-tr-sm">
               ${text}
+            </div>
+            <!-- Action Bar: Visible only on hover -->
+            <div class="flex gap-2 mr-2 opacity-0 group-hover:opacity-100 transition-opacity items-center">
+              <button onclick="navigator.clipboard.writeText('${escapedText}')" class="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-colors" title="复制">
+                <svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              </button>
+              <button onclick="const i = document.getElementById('queryInput'); i.value = '${escapedText}'; i.focus();" class="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-colors" title="重新编辑">
+                <svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
+              </button>
             </div>
           </div>
         </div>
@@ -323,17 +468,27 @@ scrollToBottom();
       }
 
       const htmlContent = marked.parse(markdownText);
+      const escapedMd = markdownText.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');
       
       chatHistory.innerHTML += `
-        <div class="flex gap-4 flex-row">
-          <div class="w-8 h-8 rounded-full bg-[#1a73e8] flex items-center justify-center shrink-0 mt-1">
-            <svg class="w-4 h-4 text-white" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 7.5H22l-6 4.5 2.5 7.5L12 17l-6 4.5 2.5-7.5L2 9.5h7.5L12 2z"/></svg>
+        <div class="flex gap-4 flex-row group">
+          <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
+            <svg class="w-6 h-6 outline-none" fill="#4285f4" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+            </svg>
           </div>
-          <div class="flex flex-col gap-3 items-start w-full">
+          <div class="flex flex-col gap-1 items-start w-full">
             <div class="px-5 py-3.5 text-[15px] leading-relaxed text-[#1f1f1f] rounded-3xl w-full markdown-body">
               ${htmlContent}
             </div>
             ${evHTML}
+            <!-- Action Bar: Visible only on hover -->
+            <div class="flex gap-2 ml-2 opacity-0 group-hover:opacity-100 transition-opacity items-center mt-1">
+              <button onclick="navigator.clipboard.writeText('${escapedMd}'); const i=this.querySelector('svg'); const old=i.innerHTML; i.innerHTML='<polyline points=\\'20 6 9 17 4 12\\'></polyline>'; setTimeout(()=>i.innerHTML=old, 1500);" class="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-colors flex items-center gap-1.5 text-xs text-gray-500 font-medium" title="复制结果">
+                <svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                <span>复制</span>
+              </button>
+            </div>
           </div>
         </div>
       `;
@@ -344,13 +499,23 @@ scrollToBottom();
       const id = 'load-' + Date.now();
       chatHistory.innerHTML += `
         <div id="${id}" class="flex gap-4">
-          <div class="w-8 h-8 rounded-full bg-[#1a73e8]/90 animate-pulse flex items-center justify-center shrink-0">
-            <svg class="w-4 h-4 text-white" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.5 7.5H22l-6 4.5 2.5 7.5L12 17l-6 4.5 2.5-7.5L2 9.5h7.5L12 2z"/></svg>
+          <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
+            <svg class="w-6 h-6 outline-none" fill="url(#sparkle-loading-grad2)" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="sparkle-loading-grad2" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stop-color="#4285f4" />
+                  <stop offset="50%" stop-color="#9b72cb" />
+                  <stop offset="100%" stop-color="#d96570" />
+                </linearGradient>
+              </defs>
+              <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+            </svg>
           </div>
-          <div class="px-5 flex items-center gap-1.5 h-[48px]">
-            <div class="w-2 h-2 bg-[#80868b] rounded-full animate-bounce" style="animation-delay: -0.3s"></div>
-            <div class="w-2 h-2 bg-[#80868b] rounded-full animate-bounce" style="animation-delay: -0.15s"></div>
-            <div class="w-2 h-2 bg-[#80868b] rounded-full animate-bounce"></div>
+          <div class="px-5 flex items-center justify-center gap-1.5 h-[32px] mt-1 relative">
+            <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.3s"></div>
+            <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.15s"></div>
+            <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce"></div>
+            <span class="ml-3 text-[14px] font-medium text-[#444746]">思考中...</span>
           </div>
         </div>
       `;

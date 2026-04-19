@@ -1,109 +1,59 @@
-# VisionRAG-ColPali
+# VisionRAG
 
-多文档多模态 RAG 系统：使用 ColPali 直接理解 PDF 页面图像，结合 MUVERA + Qdrant 两阶段检索，再由 Doubao 视觉模型生成答案。
+多文档多模态 RAG 系统：使用 ColPali 直接理解 PDF 页面图像，结合 MUVERA + Qdrant 两阶段检索，再由大型视觉模型（如 Doubao、Gemini）生成答案。
 
-本仓库已进入分阶段升级状态：
-- Phase 1 已完成：修复跨文档串档、证据重复、上传覆盖问题。
-- Phase 2 已启动：新增 FastAPI + Next.js 脚手架，准备替换 Streamlit 入口。
+当前版本拥有一个现代化的类 Gemini 风格客户端，采用纯 Vanilla HTML/JS+Tailwind 构建前端，基于 FastAPI 提供强劲响应。
 
-## 推荐仓库名
-- VisionRAG-ColPali
+## 🌟 核心特性
+- **支持多文件上传与管理**: 并发特征提取保存至 Qdrant，支持查看当前已加载的所有文档 (`/api/rag/files`)
+- **快捷键交互**: 回车键 (`Enter`) 换行，命令+回车 (`Cmd+Enter` / `Ctrl+Enter`) 发送消息
+- **多模态精准溯源**: 提供原文页面图片引用预览，点击图片以弹窗大图形式查看
+- **极简式无缝 UI**: 精致的欢迎页网格导航，通过右上角快速查询已加载文件，纯粹顺滑的使用体验
 
-## 当前项目结构
+## 📂 项目结构
 
 ```text
 RAG/
-├── app.py                         # 当前可运行入口（已支持多文档并存与范围检索）
+├── app.py                         # 旧版 Streamlit 入口
+├── fix_ui.py                      # UI 更新补丁或辅助脚本
 ├── requirements.txt
-├── .env.example
-├── backend/                       # Phase 2: FastAPI 脚手架
+├── src/                           # AI 核心逻辑引擎
+│   ├── config.py
+│   ├── llm_generator.py           # 大模型生成逻辑
+│   ├── pdf_processor.py           # PDF 解析
+│   └── vector_store.py            # Qdrant + ColPali + Muvera 封装
+├── backend/                       # FastAPI 后端服务
 │   ├── requirements.txt
 │   └── app/
-│       ├── main.py
-│       └── api/routes/health.py
-├── frontend/                      # Phase 2: Next.js 脚手架
-│   ├── package.json
-│   ├── next.config.mjs
-│   └── app/
-│       ├── layout.tsx
-│       ├── page.tsx
-│       └── styles.css
-├── data/
-│   └── cache_images/
-└── src/
-    ├── config.py
-    ├── pdf_processor.py
-    ├── vector_store.py
-    ├── llm_generator.py
-    └── utils/helper.py
+│       ├── main.py                # FastAPI 启动文件及静态资源代理
+│       └── api/routes/
+│           ├── health.py          # 健康检查
+│           └── rag.py             # RAG 对话、文件上传与已加载文档查询
+└── frontend/                      # 现代 UI 客户端
+    └── index.html                 # 纯前段 HTML/Tailwind/JS 页面
 ```
 
-## 已完成的关键修复
+## 🚀 快速启动
 
-1. 文档隔离入库
-- 每页向量 payload 新增 document_id、document_name、page_number。
-- 同一文档重复上传会先删除旧向量再写入，避免脏数据累计。
-
-2. 检索范围控制
-- 默认仅检索“当前文档”。
-- 可切换为“全部文档”。
-
-3. 证据去重
-- 返回证据按 document_id + page_number + image_path 去重，避免 1 页文件机械重复显示。
-
-4. 多文档并存
-- 上传新 PDF 不会覆盖旧文档可见性，侧边栏可切换当前文档。
-
-## 环境启动（当前可用）
-
-### 1) Python 环境
-
+**1. 准备环境 (推荐 Python 3.10+)**
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -U pip
 pip install -r requirements.txt
+pip install -r backend/requirements.txt
 ```
 
-### 2) 配置环境变量
-
+**2. 启动基础依赖 (Qdrant)**
+确保本地已安装运行 Qdrant 数据库（如使用 Docker）：
 ```bash
-cp .env.example .env
+docker run -p 6333:6333 -p 6334:6334 \
+    -v $(pwd)/data/qdrant_local:/qdrant/storage:z \
+    qdrant/qdrant
 ```
 
-编辑 .env，设置 ARK_API_KEY。
-
-### 3) 启动 Qdrant（建议持久化卷）
-
+**3. 运行服务并访问**
+使用 uvicorn 跑起 FastAPI 后端，会自动代理挂载 frontend 静态文件夹。
 ```bash
-docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
+python -m uvicorn backend.app.main:app --reload --port 8000
 ```
-
-### 4) 启动当前应用
-
-```bash
-streamlit run app.py
-```
-
-## Phase 2 脚手架试跑
-
-### FastAPI
-
-```bash
-cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
-```
-
-### Next.js
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-## 说明
-
-- 当前生产可用路径仍是 Streamlit 入口。
-- backend/frontend 已完成基础骨架，后续会把检索和入库能力完整迁移到 API + Web 前端。
+打开浏览器访问 [http://localhost:8000/](http://localhost:8000/) 即可体验前端最新版本。

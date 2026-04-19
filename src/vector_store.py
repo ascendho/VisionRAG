@@ -229,6 +229,36 @@ class VisionVectorStore:
         )
         return True
 
+    def get_all_documents(self) -> List[Dict[str, Any]]:
+        """
+        获取当前向量库中所有已装载的独立文件列表。
+        通过聚合 payload 中的 document_id 和 document_name 实现。
+        """
+        try:
+            records, _ = self.qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                with_payload=["document_id", "document_name", "page_number"],
+                with_vectors=False,
+                limit=10000
+            )
+            
+            docs = {}
+            for r in records:
+                doc_id = r.payload.get("document_id")
+                if doc_id:
+                    if doc_id not in docs:
+                        docs[doc_id] = {
+                            "document_id": doc_id,
+                            "document_name": r.payload.get("document_name", "Unknown File"),
+                            "page_count": 0
+                        }
+                    docs[doc_id]["page_count"] += 1
+                    
+            return list(docs.values())
+        except Exception as e:
+            print(f"Error fetching documents: {e}")
+            return []
+
     def retrieve_with_two_stage(
         self,
         query_text: str,
