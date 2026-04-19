@@ -1,0 +1,31 @@
+# 敏感凭证与环境变量（切勿上传，防泄露！）
+.env
+.env.*
+
+# 多模态 RAG 业务本地缓存与数据库（避免将几百 MB 的图片特征与原始数据提交）
+data/
+cache_images/
+qdrant_local/
+
+# Python 环境
+venv/
+env/
+.venv/
+.env_lang/
+__pycache__/
+*.pyc
+
+# macOS 系统缓存
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Jupyter 与其他代码编辑器缓存
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Pytest 等测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
