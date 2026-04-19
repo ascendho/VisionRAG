@@ -3,7 +3,6 @@
 .env.*
 
 # 多模态 RAG 业务本地缓存与数据库（避免将几百 MB 的图片特征与原始数据提交）
-data/
 cache_images/
 qdrant_local/
 

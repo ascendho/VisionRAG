@@ -1,9 +1,11 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import os
 import shutil
 import tempfile
+import glob
 
 from src.pdf_processor import process_pdf_to_images, get_file_hash
 from src.llm_generator import generate_answer_with_vision
@@ -16,6 +18,35 @@ class ChatRequest(BaseModel):
     document_ids: Optional[List[str]] = None
     chat_history: Optional[List[dict]] = None
     top_k: int = 3
+
+@router.get("/files/{document_id}/download")
+def download_pdf(document_id: str):
+    """
+    Download the original PDF file.
+    """
+    pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+    pattern = os.path.join(pdfs_dir, f"{document_id}_*.pdf")
+    matches = glob.glob(pattern)
+    
+    fallback_path = os.path.join(pdfs_dir, f"{document_id}.pdf")
+    
+    pdf_path = None
+    if matches:
+        pdf_path = matches[0]
+    elif os.path.exists(fallback_path):
+        pdf_path = fallback_path
+        
+    if not pdf_path:
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    filename = os.path.basename(pdf_path)
+    
+    return FileResponse(
+        pdf_path, 
+        media_type="application/pdf", 
+        content_disposition_type="inline", 
+        filename=filename
+    )
 
 @router.get("/files")
 def list_files():
@@ -43,6 +74,16 @@ def delete_file(document_id: str):
         
     try:
         vector_store_instance.delete_document(document_id)
+        
+        pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+        pattern = os.path.join(pdfs_dir, f"{document_id}_*.pdf")
+        for m in glob.glob(pattern):
+            os.remove(m)
+            
+        fallback_path = os.path.join(pdfs_dir, f"{document_id}.pdf")
+        if os.path.exists(fallback_path):
+            os.remove(fallback_path)
+            
         return {"status": "success", "message": f"Document {document_id} deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -71,6 +112,13 @@ def upload_pdf(file: UploadFile = File(...)):
             raise HTTPException(status_code=500, detail="未能成功解析出任何页面图像")
             
         file_hash = get_file_hash(temp_path)
+        safe_filename = file.filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
+        
+        # 保存持久化 PDF
+        pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+        os.makedirs(pdfs_dir, exist_ok=True)
+        final_pdf_path = os.path.join(pdfs_dir, f"{file_hash}_{safe_filename}")
+        shutil.copy(temp_path, final_pdf_path)
         
         # 避免并发时引错库，延迟导入或从全局拿， 这里我们可以从全局获取 vector_store_instance，或者重新调单例
         # 为简单起见，从 main 导入全局实例

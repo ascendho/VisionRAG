@@ -47,7 +47,7 @@ pip install -r backend/requirements.txt
 确保本地已安装运行 Qdrant 数据库（如使用 Docker）：
 ```bash
 docker run -p 6333:6333 -p 6334:6334 \
-    -v $(pwd)/data/qdrant_local:/qdrant/storage:z \
+    -v $(pwd)/qdrant_local:/qdrant/storage:z \
     qdrant/qdrant
 ```
 

@@ -1,0 +1,44 @@
+/* frontend/styles.css */
+body {
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  margin: 0;
+  height: 100vh;
+}
+.hide-scrollbar::-webkit-scrollbar { display: none; }
+.hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+.welcome-card {
+  transition: all 0.2s ease-in-out;
+  border-radius: 16px;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 130px;
+  cursor: pointer;
+  border: 1px solid #e2e8f0;
+}
+
+.welcome-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+}
+
+/* Hide scrollbar for clean look */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: #dce3f0;
+  border-radius: 4px;
+}
+
+:root.dark ::-webkit-scrollbar-thumb {
+  background: #475569;
+}
+
+.markdown-body p { margin-bottom: 0.75rem; line-height: 1.6; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3 { font-weight: 600; margin-bottom: 0.5rem; }
+.markdown-body ul { list-style-type: disc; padding-left: 1.5rem; margin-bottom: 0.75rem; }
+.markdown-body code { padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; }
