@@ -320,7 +320,7 @@ function addUserMessage(text) {
   const escapedText = text.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');
   chatHistory.innerHTML += `
     <div class="flex gap-4 flex-row-reverse group">
-      <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1 bg-gradient-to-tr from-blue-500 to-indigo-500 shadow-md">
+      <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1 bg-gradient-to-tr from-purple-500 to-fuchsia-500 shadow-md">
         <span class="text-[11px] font-bold text-white tracking-wider">ME</span>
       </div>
       <div class="flex flex-col gap-1 items-end max-w-[80%]">
