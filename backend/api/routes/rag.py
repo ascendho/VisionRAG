@@ -53,7 +53,7 @@ def list_files():
     """
     Returns a list of all uniquely uploaded documents in the vector store.
     """
-    from backend.app.main import vector_store_instance
+    from backend.main import vector_store_instance
     if vector_store_instance is None:
         raise HTTPException(status_code=500, detail="Qdrant backend is not ready")
 
@@ -68,7 +68,7 @@ def delete_file(document_id: str):
     """
     Deletes a document from the vector store by its ID.
     """
-    from backend.app.main import vector_store_instance
+    from backend.main import vector_store_instance
     if vector_store_instance is None:
         raise HTTPException(status_code=500, detail="Qdrant backend is not ready")
         
@@ -122,7 +122,7 @@ def upload_pdf(file: UploadFile = File(...)):
         
         # 避免并发时引错库，延迟导入或从全局拿， 这里我们可以从全局获取 vector_store_instance，或者重新调单例
         # 为简单起见，从 main 导入全局实例
-        from backend.app.main import vector_store_instance
+        from backend.main import vector_store_instance
         
         if vector_store_instance is None:
             raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
@@ -159,7 +159,7 @@ def chat(req: ChatRequest):
     进行两阶段召回后使用豆包生成答案，返回文字回答以及匹配到的页面图片（供溯源）。
     """
     try:
-        from backend.app.main import vector_store_instance
+        from backend.main import vector_store_instance
         if vector_store_instance is None:
             raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
             

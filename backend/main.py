@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from backend.app.api.routes.health import router as health_router
+from backend.api.routes.health import router as health_router
 
 # 这个全局实例要在 lifespan 里初始化，之后在各个路由中导入
 vector_store_instance = None
@@ -41,7 +41,7 @@ app.add_middleware(
 app.include_router(health_router)
 
 # 放到最后导入防止出现循环依赖
-from backend.app.api.routes.rag import router as rag_router
+from backend.api.routes.rag import router as rag_router
 app.include_router(rag_router, prefix="/api/rag", tags=["RAG"])
 
 # 挂载前端静态文件，提供单一的 Gemini 风格纯 HTML/JS 服务

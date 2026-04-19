@@ -22,11 +22,10 @@ RAG/
 │   ├── pdf_processor.py           # PDF 解析
 │   └── vector_store.py            # Qdrant + ColPali + Muvera 封装
 ├── backend/                       # FastAPI 后端服务
-│   └── app/
-│       ├── main.py                # FastAPI 启动文件及静态资源代理
-│       └── api/routes/
-│           ├── health.py          # 健康检查
-│           └── rag.py             # RAG 对话、文件上传与已加载文档查询
+│   ├── main.py                # FastAPI 启动文件及静态资源代理
+│   └── api/routes/
+│       ├── health.py          # 健康检查
+│       └── rag.py             # RAG 对话、文件上传与已加载文档查询
 ├── frontend/                      # 现代 UI 客户端
 │   ├── index.html                 # 纯前段 HTML/Tailwind 页面
 │   └── app.js                     # 纯前段 JS 逻辑
@@ -53,6 +52,6 @@ docker run -p 6333:6333 -p 6334:6334 \
 **3. 运行服务并访问**
 使用 uvicorn 跑起 FastAPI 后端，会自动代理挂载 frontend 静态文件夹。
 ```bash
-python -m uvicorn backend.app.main:app --reload --port 8000
+python -m uvicorn backend.main:app --reload --port 8000
 ```
 打开浏览器访问 [http://localhost:8000/](http://localhost:8000/) 即可体验前端最新版本。
