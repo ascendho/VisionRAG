@@ -15,17 +15,6 @@ const messagesContainer = document.getElementById('messagesContainer');
 const appBody = document.getElementById('appBody');
 const appMain = document.getElementById('appMain');
 
-// UI State Management
-function setFloatingCardUI() {
-  appBody.className = "flex items-center justify-center h-screen overflow-hidden bg-gradient-to-br from-[#f8ebfc] via-[#faeff2] to-[#fffee0] dark:from-slate-900 dark:via-slate-800 dark:to-slate-900 transition-colors p-4 md:p-8 transition-all duration-700";
-  appMain.className = "w-full max-w-6xl h-full max-h-[90vh] bg-white/95 dark:bg-slate-900/95 rounded-[32px] shadow-[0_10px_40px_-15px_rgba(0,0,0,0.1)] flex flex-col relative overflow-hidden ring-1 ring-black/5 dark:ring-white/10 transition-all duration-700";
-}
-
-function setFullScreenUI() {
-  appBody.className = "flex h-screen overflow-hidden bg-white dark:bg-slate-900 transition-colors transition-all duration-700";
-  appMain.className = "flex-1 flex flex-col h-full relative transition-all duration-700";
-}
-
 // Theme Management
 function initTheme() {
   try {
@@ -183,7 +172,6 @@ document.addEventListener('keydown', (e) => {
 
 // Handle Uploads
 function showUploadingAnimation(text) {
-  setFloatingCardUI();
   welcomeScreen.classList.add("hidden");
   chatHistory.classList.remove("hidden");
   inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
@@ -259,7 +247,6 @@ async function handleChat(fromHistory = false) {
   }
 
   // Hide welcome, show chat and transition UI
-  setFloatingCardUI();
   welcomeScreen.classList.add("hidden");
   chatHistory.classList.remove("hidden");
   inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
@@ -316,7 +303,6 @@ function resetUI(fromHistory = false) {
   if (fromHistory !== true && history.state && history.state.view === 'chat') {
     history.pushState({view: 'home'}, '', window.location.pathname);
   }
-  setFullScreenUI();
   welcomeScreen.classList.remove("hidden");
   chatHistory.classList.add("hidden");
   inputContainer.classList.add("-translate-y-[25vh]", "md:-translate-y-[30vh]");
@@ -328,7 +314,6 @@ function resetUI(fromHistory = false) {
 
 window.addEventListener('popstate', (e) => {
   if (e.state && e.state.view === 'chat') {
-    setFloatingCardUI();
     welcomeScreen.classList.add("hidden");
     chatHistory.classList.remove("hidden");
     inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
@@ -350,7 +335,7 @@ function addUserMessage(text) {
         <span class="text-[11px] font-bold text-white tracking-wider">ME</span>
       </div>
       <div class="flex flex-col gap-1 items-end max-w-[80%]">
-        <div class="px-5 py-3.5 text-[15px] leading-relaxed bg-[#f0f4f9] dark:bg-slate-800 text-[#1f1f1f] dark:text-slate-200 rounded-3xl rounded-tr-sm">
+        <div class="px-5 py-3.5 text-[16px] leading-[1.75] bg-[#f0f4f9] dark:bg-slate-800 text-[#1f1f1f] dark:text-slate-200 rounded-[24px] rounded-tr-sm">
           ${text}
         </div>
         <!-- Action Bar: Visible only on hover -->
@@ -412,7 +397,7 @@ function addAssistantMessage(markdownText, evidences = []) {
         </svg>
       </div>
       <div class="flex flex-col gap-1 items-start w-full">
-        <div class="px-5 py-3.5 text-[15px] leading-relaxed text-[#1f1f1f] dark:text-slate-200 rounded-3xl w-full markdown-body">
+        <div class="text-[16px] leading-[1.8] text-[#1f1f1f] dark:text-slate-200 w-full markdown-body">
           ${htmlContent}
         </div>
         ${evHTML}
