@@ -14,7 +14,6 @@
 
 ```text
 RAG/
-├── app.py                         # 旧版 Streamlit 入口
 ├── fix_ui.py                      # UI 更新补丁或辅助脚本
 ├── requirements.txt
 ├── src/                           # AI 核心逻辑引擎
@@ -23,14 +22,15 @@ RAG/
 │   ├── pdf_processor.py           # PDF 解析
 │   └── vector_store.py            # Qdrant + ColPali + Muvera 封装
 ├── backend/                       # FastAPI 后端服务
-│   ├── requirements.txt
 │   └── app/
 │       ├── main.py                # FastAPI 启动文件及静态资源代理
 │       └── api/routes/
 │           ├── health.py          # 健康检查
 │           └── rag.py             # RAG 对话、文件上传与已加载文档查询
-└── frontend/                      # 现代 UI 客户端
-    └── index.html                 # 纯前段 HTML/Tailwind/JS 页面
+├── frontend/                      # 现代 UI 客户端
+│   ├── index.html                 # 纯前段 HTML/Tailwind 页面
+│   └── app.js                     # 纯前段 JS 逻辑
+└── qdrant_local/                  # 本地向量库及上传文件缓存
 ```
 
 ## 🚀 快速启动
@@ -40,7 +40,6 @@ RAG/
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-pip install -r backend/requirements.txt
 ```
 
 **2. 启动基础依赖 (Qdrant)**
