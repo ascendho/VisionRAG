@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 # 加载当前目录下的 .env 文件中定义的环境变量
 load_dotenv()
 
+# 设置 Hugging Face 国内镜像源，解决下载 SSL/TLS 连接断开的问题
+os.environ["HF_ENDPOINT"] = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
+
 # Qdrant 数据库连接地址（本地 Docker 环境运行 Qdrant）
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 

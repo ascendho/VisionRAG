@@ -23,7 +23,8 @@ class VisionVectorStore:
     """
     def __init__(self):
         # 1. 链接至本地 Docker 容器启动的 Qdrant 数据库
-        self.qdrant = QdrantClient(url=QDRANT_URL)
+        # check_compatibility=False 屏蔽客户端与服务端的版本次要差异警告
+        self.qdrant = QdrantClient(url=QDRANT_URL, check_compatibility=False)
         
         # 2. 定义 MUVERA 实例进行维度压缩与计算加速
         # 这是一种针对 Late-Interaction 模型的多维聚类方式，用于缓解在海量文档下搜索时的性能瓶颈

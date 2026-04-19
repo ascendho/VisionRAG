@@ -12,29 +12,51 @@ const inputContainer = document.getElementById('inputContainer');
 const welcomeScreen = document.getElementById('welcomeScreen');
 const chatHistory = document.getElementById('chatHistory');
 const messagesContainer = document.getElementById('messagesContainer');
+const appBody = document.getElementById('appBody');
+const appMain = document.getElementById('appMain');
+
+// UI State Management
+function setFloatingCardUI() {
+  appBody.className = "flex items-center justify-center h-screen overflow-hidden bg-gradient-to-br from-[#f8ebfc] via-[#faeff2] to-[#fffee0] dark:from-slate-900 dark:via-slate-800 dark:to-slate-900 transition-colors p-4 md:p-8 transition-all duration-700";
+  appMain.className = "w-full max-w-6xl h-full max-h-[90vh] bg-white/95 dark:bg-slate-900/95 rounded-[32px] shadow-[0_10px_40px_-15px_rgba(0,0,0,0.1)] flex flex-col relative overflow-hidden ring-1 ring-black/5 dark:ring-white/10 transition-all duration-700";
+}
+
+function setFullScreenUI() {
+  appBody.className = "flex h-screen overflow-hidden bg-white dark:bg-slate-900 transition-colors transition-all duration-700";
+  appMain.className = "flex-1 flex flex-col h-full relative transition-all duration-700";
+}
 
 // Theme Management
 function initTheme() {
-  if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMatchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-    // Force default to light as per requirements if not explicitly set, 
-    // but let's actually just default to light unconditionally if not set.
-  }
-  
-  if (localStorage.theme === 'dark') {
-    document.documentElement.classList.add('dark');
-  } else {
+  try {
+    if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+      // Force default to light as per requirements if not explicitly set, 
+      // but let's actually just default to light unconditionally if not set.
+    }
+    
+    if (localStorage.theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+      localStorage.theme = 'light';
+    }
+  } catch (e) {
+    // Safari strict mode localStorage security error fallback
     document.documentElement.classList.remove('dark');
-    localStorage.theme = 'light';
   }
 }
 
 function toggleTheme() {
-  if (document.documentElement.classList.contains('dark')) {
-    document.documentElement.classList.remove('dark');
-    localStorage.theme = 'light';
-  } else {
-    document.documentElement.classList.add('dark');
-    localStorage.theme = 'dark';
+  try {
+    if (document.documentElement.classList.contains('dark')) {
+      document.documentElement.classList.remove('dark');
+      localStorage.theme = 'light';
+    } else {
+      document.documentElement.classList.add('dark');
+      localStorage.theme = 'dark';
+    }
+  } catch (e) {
+    document.documentElement.classList.toggle('dark');
   }
 }
 
@@ -161,9 +183,10 @@ document.addEventListener('keydown', (e) => {
 
 // Handle Uploads
 function showUploadingAnimation(text) {
+  setFloatingCardUI();
   welcomeScreen.classList.add("hidden");
   chatHistory.classList.remove("hidden");
-  inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[35vh]");
+  inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
   
   const id = 'load-' + Date.now();
   chatHistory.innerHTML += `
@@ -235,10 +258,11 @@ async function handleChat(fromHistory = false) {
     history.pushState({view: 'chat'}, '', '#chat');
   }
 
-  // Hide welcome, show chat
+  // Hide welcome, show chat and transition UI
+  setFloatingCardUI();
   welcomeScreen.classList.add("hidden");
   chatHistory.classList.remove("hidden");
-  inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[35vh]");
+  inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
 
   addUserMessage(text);
   queryInput.value = "";
@@ -292,9 +316,10 @@ function resetUI(fromHistory = false) {
   if (fromHistory !== true && history.state && history.state.view === 'chat') {
     history.pushState({view: 'home'}, '', window.location.pathname);
   }
+  setFullScreenUI();
   welcomeScreen.classList.remove("hidden");
   chatHistory.classList.add("hidden");
-  inputContainer.classList.add("-translate-y-[25vh]", "md:-translate-y-[35vh]");
+  inputContainer.classList.add("-translate-y-[25vh]", "md:-translate-y-[30vh]");
   
   queryInput.value = "";
   isChatting = false;
@@ -303,9 +328,10 @@ function resetUI(fromHistory = false) {
 
 window.addEventListener('popstate', (e) => {
   if (e.state && e.state.view === 'chat') {
+    setFloatingCardUI();
     welcomeScreen.classList.add("hidden");
     chatHistory.classList.remove("hidden");
-    inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[35vh]");
+    inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
   } else {
     resetUI(true);
   }
