@@ -6,7 +6,6 @@
 
 ## 🌟 核心特性
 - **支持多文件上传与管理**: 并发特征提取保存至 Qdrant，支持查看当前已加载的所有文档 (`/api/rag/files`)
-- **快捷键交互**: 回车键 (`Enter`) 换行，命令+回车 (`Cmd+Enter` / `Ctrl+Enter`) 发送消息
 - **多模态精准溯源**: 提供原文页面图片引用预览，点击图片以弹窗大图形式查看
 - **极简式无缝 UI**: 精致的欢迎页网格导航，通过右上角快速查询已加载文件，纯粹顺滑的使用体验
 
@@ -14,7 +13,6 @@
 
 ```text
 RAG/
-├── fix_ui.py                      # UI 更新补丁或辅助脚本
 ├── requirements.txt
 ├── src/                           # AI 核心逻辑引擎
 │   ├── config.py
@@ -27,9 +25,8 @@ RAG/
 │       ├── health.py          # 健康检查
 │       └── rag.py             # RAG 对话、文件上传与已加载文档查询
 ├── frontend/                      # 现代 UI 客户端
-│   ├── index.html                 # 纯前段 HTML/Tailwind 页面
-│   └── app.js                     # 纯前段 JS 逻辑
-└── qdrant_local/                  # 本地向量库及上传文件缓存
+    ├── index.html                 # 纯前段 HTML/Tailwind 页面
+    └── app.js                     # 纯前段 JS 逻辑
 ```
 
 ## 🚀 快速启动
