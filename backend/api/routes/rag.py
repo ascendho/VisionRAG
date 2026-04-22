@@ -9,6 +9,7 @@ import glob
 
 from src.pdf_processor import process_pdf_to_images, get_file_hash
 from src.llm_generator import generate_answer_with_vision
+from src.evidence_localizer import extract_and_cache_page_regions, build_localized_evidences
 
 router = APIRouter()
 
@@ -110,6 +111,11 @@ def upload_pdf(file: UploadFile = File(...)):
         
         if not image_paths:
             raise HTTPException(status_code=500, detail="未能成功解析出任何页面图像")
+
+        try:
+            extract_and_cache_page_regions(temp_path, image_paths)
+        except Exception as region_err:
+            print(f"[Warning] 页面区域提取失败，将回退到整页证据: {region_err}")
             
         file_hash = get_file_hash(temp_path)
         safe_filename = file.filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
@@ -170,26 +176,8 @@ def chat(req: ChatRequest):
             top_k=req.top_k
         )
         
-        # 将被选中的匹配证据转换结构，准备喂给生成模型的同时发送前端
-        evidence_images = []
-        frontend_evidences = []
-        
-        for idx, res in enumerate(results):
-            image_path = res["image_path"]
-            doc_target = res["document_name"]
-            page_idx = res["page_number"]
-            # 给大模型做参考
-            evidence_images.append(image_path)
-            # 供展示给用户看的纯前端元数据结构
-            frontend_evidences.append({
-                "document_name": doc_target,
-                "page_number": page_idx,
-                "score": float(res["score"]),
-                # 这里不传绝对路径，而是考虑我们可以发一个可以被图片直接读取的 URL 或者 base64。
-                # 但考虑到图片可能在本地，我们可以先只把绝对路径当 src (本地调试时有权限)，其实正规做法应暴露静态文件路由。
-                # 这里为了简单，我们会把图片转成 base64 给前端。
-                "image_base64": image_path_to_base64(image_path)
-            })
+        localized_evidences = build_localized_evidences(req.query, results)
+        evidence_images = [evidence["image_path"] for evidence in localized_evidences if evidence.get("image_path")]
 
         if not evidence_images:
             return {
@@ -202,6 +190,21 @@ def chat(req: ChatRequest):
             query_text=req.query,
             image_paths=evidence_images
         )
+
+        frontend_evidences = []
+        for evidence in localized_evidences:
+            image_path = evidence.get("image_path", "")
+            if not image_path:
+                continue
+            frontend_evidences.append({
+                "document_name": evidence.get("document_name", "Unknown File"),
+                "page_number": evidence.get("page_number", 0),
+                "score": float(evidence.get("score", 0.0)),
+                "image_kind": evidence.get("image_kind", "page"),
+                "image_size": evidence.get("image_size", []),
+                "regions": evidence.get("regions", []),
+                "image_base64": image_path_to_base64(image_path)
+            })
         
         return {
             "answer": answer_text,

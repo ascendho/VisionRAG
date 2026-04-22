@@ -52,10 +52,15 @@ function toggleTheme() {
 initTheme();
 
 // Lightbox functions
-function openImageModal(base64Src) {
+function openImageModal(base64Src, encodedRegions = '') {
   const modal = document.getElementById('imageModal');
   const modalImg = document.getElementById('modalImage');
+  const modalOverlay = document.getElementById('modalOverlay');
+
   modalImg.src = base64Src;
+  const regions = decodeRegions(encodedRegions);
+  modalOverlay.innerHTML = buildRegionOverlay(regions, 'modal');
+
   modal.classList.remove('hidden');
   modal.classList.add('flex');
   setTimeout(() => modal.classList.remove('opacity-0'), 10);
@@ -327,6 +332,78 @@ function scrollToBottom() {
   messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
 }
 
+function decodeRegions(encodedRegions) {
+  if (!encodedRegions) return [];
+  try {
+    const parsed = JSON.parse(decodeURIComponent(encodedRegions));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function encodeRegions(regions) {
+  try {
+    return encodeURIComponent(JSON.stringify(Array.isArray(regions) ? regions : []));
+  } catch (e) {
+    return '';
+  }
+}
+
+function clamp01(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.min(1, Math.max(0, num));
+}
+
+function buildRegionOverlay(regions, mode = 'card') {
+  if (!Array.isArray(regions) || regions.length === 0) return '';
+
+  const maxRegions = mode === 'modal' ? 8 : 3;
+  const sorted = regions
+    .filter(r => Array.isArray(r.bbox_norm) && r.bbox_norm.length === 4)
+    .sort((a, b) => (Number(b.region_score) || 0) - (Number(a.region_score) || 0))
+    .slice(0, maxRegions);
+
+  return sorted.map((region, idx) => {
+    const [l, t, r, b] = region.bbox_norm.map(clamp01);
+    const left = (l * 100).toFixed(2);
+    const top = (t * 100).toFixed(2);
+    const width = ((r - l) * 100).toFixed(2);
+    const height = ((b - t) * 100).toFixed(2);
+    const cls = mode === 'modal'
+      ? 'border-2 border-amber-400/90 bg-amber-300/15'
+      : 'border border-amber-400/90 bg-amber-300/20';
+
+    return `<div class="absolute ${cls} rounded-sm" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%;"></div>`;
+  }).join('');
+}
+
+function getEvidenceSnippet(ev) {
+  if (!ev || !Array.isArray(ev.regions) || ev.regions.length === 0) return '';
+  const best = [...ev.regions]
+    .filter(r => typeof r.text === 'string')
+    .sort((a, b) => (Number(b.region_score) || 0) - (Number(a.region_score) || 0))[0];
+  return best && best.text ? escapeHtml(best.text) : '';
+}
+
+function getEvidenceAspectRatio(ev) {
+  if (!ev || !Array.isArray(ev.image_size) || ev.image_size.length !== 2) return '4 / 3';
+  const w = Number(ev.image_size[0]);
+  const h = Number(ev.image_size[1]);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return '4 / 3';
+  return `${w} / ${h}`;
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function addUserMessage(text) {
   const escapedText = text.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');
   chatHistory.innerHTML += `
@@ -361,17 +438,27 @@ function addAssistantMessage(markdownText, evidences = []) {
   if (evidences && evidences.length > 0) {
     let cards = evidences.map(ev => {
       const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
+      const encodedRegions = encodeRegions(ev.regions || []);
+      const overlayHtml = buildRegionOverlay(ev.regions || [], 'card');
+      const snippet = getEvidenceSnippet(ev);
+      const regionCount = Array.isArray(ev.regions) ? ev.regions.length : 0;
+      const evidenceKind = regionCount > 0 ? `高亮区域 ${regionCount}` : '整页';
+      const aspectRatio = getEvidenceAspectRatio(ev);
       return `
-      <div class="snap-start shrink-0 w-[140px] md:w-[160px] bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}')">
-        <div class="relative">
-          <img src="${imgSrc}" class="w-full h-[100px] object-cover bg-[#f0f4f9] dark:bg-slate-900 group-hover:scale-105 transition-transform duration-300">
+      <div class="snap-start shrink-0 w-[150px] md:w-[170px] bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}', '${encodedRegions}')">
+        <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: ${aspectRatio};">
+          <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
+          <div class="absolute inset-0 pointer-events-none">
+            ${overlayHtml}
+          </div>
           <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 dark:group-hover:bg-white/10 transition-colors flex items-center justify-center">
             <svg class="w-6 h-6 text-white opacity-0 group-hover:opacity-100 transition-opacity drop-shadow-md" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
           </div>
         </div>
         <div class="p-2.5">
           <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
-          <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} • Score: ${ev.score.toFixed(2)}</p>
+          <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} • ${evidenceKind}</p>
+          <p class="text-[11px] text-[#a0a4aa] dark:text-slate-500 mt-1 line-clamp-2 leading-snug">${snippet || `Score: ${ev.score.toFixed(2)}`}</p>
         </div>
       </div>
     `}).join('');

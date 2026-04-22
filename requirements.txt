@@ -25,6 +25,8 @@ qdrant-client==1.15.1
 fastembed==0.7.3
 pandas==2.3.2
 pdf2image==1.17.0
+pillow==11.3.0
+pymupdf==1.24.11
 pyarrow==21.0.0
 openai==2.2.0
 python-dotenv==1.0.1
