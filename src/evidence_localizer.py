@@ -183,14 +183,18 @@ def build_localized_evidences(
     max_total: int = 6,
     max_regions_per_page: int = 4,
     min_region_score: float = 0.5,
+    extra_terms: Optional[List[str]] = None,
 ) -> List[Dict[str, object]]:
     """
-    基于页级召回结果，返回“原页图 + 高亮框列表”的证据结构。
+    基于页级召回结果，返回"原页图 + 高亮框列表"的证据结构。
+
+    extra_terms: 来自 LLM 答案的附加词项，与 query_terms 合并后一起用于区域打分。
+    通过"答案驱动高亮"机制弥补 query 措辞与 PDF 原文之间的语义鸿沟。
     """
     if not results:
         return []
 
-    query_terms = _extract_query_terms(query_text)
+    query_terms = list(set(_extract_query_terms(query_text) + (extra_terms or [])))
     evidences: List[Dict[str, object]] = []
     seen_pages = set()
 
@@ -230,6 +234,44 @@ def build_localized_evidences(
                 "text": str(region.get("text", "")),
                 "region_score": float(region_score),
             })
+
+        # 标题块提升：对已匹配的描述块，将其前驱块（论文/项目标题行）也纳入高亮
+        # 规则：前驱块文本长度在 10-300 之间（标题行特征），且尚未被选中
+        selected_ids = {r["region_id"] for r in selected_regions}
+        promoted: List[Dict[str, object]] = []
+        for sel_region in list(selected_regions):
+            rid = str(sel_region.get("region_id") or "")
+            m = re.match(r"p(\d+)_b(\d+)", rid)
+            if not m:
+                continue
+            page_num_str = m.group(1)
+            block_idx = int(m.group(2))
+            if block_idx == 0:
+                continue
+            pred_rid = f"p{page_num_str}_b{block_idx - 1}"
+            if pred_rid in selected_ids:
+                continue
+            pred_region = next((pr for pr in page_regions if pr.get("region_id") == pred_rid), None)
+            if pred_region is None:
+                continue
+            pred_text = str(pred_region.get("text", "")).strip()
+            if 10 <= len(pred_text) <= 300:
+                bbox_norm = pred_region.get("bbox_norm")
+                if isinstance(bbox_norm, list) and len(bbox_norm) == 4:
+                    promoted.append({
+                        "region_id": pred_rid,
+                        "bbox_norm": [float(v) for v in bbox_norm],
+                        "text": pred_text,
+                        "region_score": sel_region.get("region_score", 1.0) * 0.9,
+                    })
+                    selected_ids.add(pred_rid)
+
+        if promoted:
+            # 标题提升结果独立追加，不与 selected_regions 竞争配额
+            # 总上限为 max_regions_per_page + 2，确保标题行不被 bullet 挤掉
+            combined = selected_regions + promoted
+            combined.sort(key=lambda r: r.get("region_score", 0), reverse=True)
+            selected_regions = combined[:max_regions_per_page + 2]
 
         evidence = _page_level_evidence(result, image_size)
         evidence["regions"] = selected_regions

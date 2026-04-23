@@ -2,6 +2,7 @@
 let uploadedDocs = [];
 let isUploading = false;
 let isChatting = false;
+let selectedDocIds = null; // null = 全部文档；array of IDs = 当前选中的范围
 
 // Elements
 const bottomFileInput = document.getElementById('bottomFileInput');
@@ -52,14 +53,11 @@ function toggleTheme() {
 initTheme();
 
 // Lightbox functions
-function openImageModal(base64Src, encodedRegions = '') {
+function openImageModal(base64Src) {
   const modal = document.getElementById('imageModal');
   const modalImg = document.getElementById('modalImage');
-  const modalOverlay = document.getElementById('modalOverlay');
 
   modalImg.src = base64Src;
-  const regions = decodeRegions(encodedRegions);
-  modalOverlay.innerHTML = buildRegionOverlay(regions, 'modal');
 
   modal.classList.remove('hidden');
   modal.classList.add('flex');
@@ -73,6 +71,88 @@ function closeImageModal() {
     modal.classList.add('hidden');
     modal.classList.remove('flex');
   }, 300);
+}
+
+function getFileIcon(filename) {
+  const ext = (filename || '').split('.').pop().toLowerCase();
+  if (ext === 'pdf') {
+    return `<div class="w-12 h-12 rounded-2xl bg-red-50 dark:bg-red-900/20 flex flex-col items-center justify-center shrink-0 border border-red-100 dark:border-red-900/50 text-red-500">
+      <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+        <polyline points="14 2 14 8 20 8"></polyline>
+        <path d="M9 15.5v-5h1.5a1.5 1.5 0 0 1 0 3H9"></path>
+        <path d="M13 15.5v-5h1a2 2 0 0 1 0 4h-1"></path>
+        <path d="M17 15.5v-5h2"></path>
+        <path d="M17 13h1.5"></path>
+      </svg>
+    </div>`;
+  } else if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
+    return `<div class="w-12 h-12 rounded-2xl bg-blue-50 dark:bg-blue-900/20 flex flex-col items-center justify-center shrink-0 border border-blue-100 dark:border-blue-900/50 text-blue-500">
+      <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+        <polyline points="21 15 16 10 5 21"></polyline>
+      </svg>
+    </div>`;
+  } else {
+    return `<div class="w-12 h-12 rounded-2xl bg-gray-100 dark:bg-slate-700 flex flex-col items-center justify-center shrink-0 border border-gray-200 dark:border-slate-600 text-gray-400">
+      <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
+        <polyline points="13 2 13 9 20 9"></polyline>
+      </svg>
+    </div>`;
+  }
+}
+
+function renderScopeBar() {
+  const bar = document.getElementById('scopeBar');
+  if (!bar) return;
+  if (uploadedDocs.length <= 1) {
+    bar.classList.add('hidden');
+    return;
+  }
+  bar.classList.remove('hidden');
+  const allActive = selectedDocIds === null;
+  const chips = [
+    `<button onclick="selectScope(null)" class="px-3 py-1 rounded-full text-[12px] font-medium border transition-colors ${
+      allActive
+        ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-600'
+        : 'bg-white dark:bg-slate-800 text-[#444746] dark:text-slate-400 border-gray-200 dark:border-slate-600 hover:border-blue-300'
+    }">全部</button>`,
+    ...uploadedDocs.map(doc => {
+      const isActive = Array.isArray(selectedDocIds) && selectedDocIds.includes(doc.document_id);
+      const label = doc.document_name.length > 20 ? doc.document_name.slice(0, 18) + '…' : doc.document_name;
+      return `<button onclick="selectScope('${doc.document_id}')" title="${doc.document_name}" class="px-3 py-1 rounded-full text-[12px] font-medium border transition-colors ${
+        isActive
+          ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-600'
+          : 'bg-white dark:bg-slate-800 text-[#444746] dark:text-slate-400 border-gray-200 dark:border-slate-600 hover:border-blue-300'
+      }">${label}</button>`;
+    })
+  ];
+  bar.innerHTML = chips.join('');
+}
+
+function selectScope(docId) {
+  if (docId === null) {
+    selectedDocIds = null;
+  } else {
+    if (!Array.isArray(selectedDocIds)) {
+      // coming from "全部" state — select just this one
+      selectedDocIds = [docId];
+    } else if (selectedDocIds.includes(docId)) {
+      // toggle off
+      const next = selectedDocIds.filter(id => id !== docId);
+      selectedDocIds = next.length === 0 ? null : next;
+    } else {
+      // toggle on
+      selectedDocIds = [...selectedDocIds, docId];
+    }
+    // if all docs are selected, treat as "全部"
+    if (Array.isArray(selectedDocIds) && selectedDocIds.length === uploadedDocs.length) {
+      selectedDocIds = null;
+    }
+  }
+  renderScopeBar();
 }
 
 async function openFilesModal() {
@@ -98,22 +178,14 @@ async function openFilesModal() {
     const data = await res.json();
     uploadedDocs = data.files || [];
     updateInputState(uploadedDocs.length);
-    
+    renderScopeBar();
+
     if (data.files && data.files.length > 0) {
       list.innerHTML = `<div class="space-y-3">
         ${data.files.map(f => `
           <div class="flex items-center justify-between p-4 rounded-3xl bg-[#f8f9fa] dark:bg-slate-800 transition-colors">
             <div class="flex items-center gap-4 min-w-0 flex-1">
-              <div class="w-12 h-12 rounded-2xl bg-red-50 dark:bg-red-900/20 flex flex-col items-center justify-center shrink-0 border border-red-100 dark:border-red-900/50 text-red-500">
-                <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                  <polyline points="14 2 14 8 20 8"></polyline>
-                  <path d="M9 15.5v-5h1.5a1.5 1.5 0 0 1 0 3H9"></path>
-                  <path d="M13 15.5v-5h1a2 2 0 0 1 0 4h-1"></path>
-                  <path d="M17 15.5v-5h2"></path>
-                  <path d="M17 13h1.5"></path>
-                </svg>
-              </div>
+              ${getFileIcon(f.document_name)}
               <div class="min-w-0 flex-1">
                 <h4 class="text-[16px] font-semibold text-[#1f1f1f] dark:text-slate-200 truncate" title="${f.document_name}">${f.document_name}</h4>
                 <p class="text-[13px] text-[#80868b] dark:text-slate-400 mt-0.5">${f.page_count} pages • Indexed</p>
@@ -134,7 +206,7 @@ async function openFilesModal() {
       list.innerHTML = `<div class="text-center py-8 text-[#80868b] dark:text-slate-400">
         <svg class="w-12 h-12 mx-auto text-gray-300 dark:text-slate-600 mb-3" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
         <p class="text-sm font-medium text-[#444746] dark:text-slate-300">还没上传文件</p>
-        <p class="text-xs mt-1">请上传 PDF 开始使用</p>
+        <p class="text-xs mt-1">请上传文档开始使用</p>
       </div>`;
     }
   } catch (err) {
@@ -225,6 +297,7 @@ async function handleUpload(file) {
     if (res.ok) {
       uploadedDocs.push(data);
       if(typeof updateInputState === 'function') updateInputState(uploadedDocs.length);
+      renderScopeBar();
       addAssistantMessage(`✅ **${data.document_name}** 已成功上传并建立索引。现在，您可以就此文档向我提问了！`);
     } else {
       addAssistantMessage(`❌ 上传失败: ${data.detail}`);
@@ -260,7 +333,7 @@ async function handleChat(fromHistory = false) {
   queryInput.value = "";
   
   if (uploadedDocs.length === 0) {
-    addAssistantMessage("🤖 提示：请先点击下方上传一份 PDF 文档～");
+    addAssistantMessage("🤖 提示：请先点击下方上传一份文档～");
     return;
   }
   
@@ -273,7 +346,7 @@ async function handleChat(fromHistory = false) {
     const res = await fetch('/api/rag/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text, top_k: 3 }) 
+      body: JSON.stringify({ query: text, top_k: 5, ...(selectedDocIds ? { document_ids: selectedDocIds } : {}) }) 
     });
     const data = await res.json();
     removeLoading(loadId);
@@ -332,69 +405,6 @@ function scrollToBottom() {
   messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
 }
 
-function decodeRegions(encodedRegions) {
-  if (!encodedRegions) return [];
-  try {
-    const parsed = JSON.parse(decodeURIComponent(encodedRegions));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function encodeRegions(regions) {
-  try {
-    return encodeURIComponent(JSON.stringify(Array.isArray(regions) ? regions : []));
-  } catch (e) {
-    return '';
-  }
-}
-
-function clamp01(value) {
-  const num = Number(value);
-  if (!Number.isFinite(num)) return 0;
-  return Math.min(1, Math.max(0, num));
-}
-
-function buildRegionOverlay(regions, mode = 'card') {
-  if (!Array.isArray(regions) || regions.length === 0) return '';
-
-  const maxRegions = mode === 'modal' ? 8 : 3;
-  const sorted = regions
-    .filter(r => Array.isArray(r.bbox_norm) && r.bbox_norm.length === 4)
-    .sort((a, b) => (Number(b.region_score) || 0) - (Number(a.region_score) || 0))
-    .slice(0, maxRegions);
-
-  return sorted.map((region, idx) => {
-    const [l, t, r, b] = region.bbox_norm.map(clamp01);
-    const left = (l * 100).toFixed(2);
-    const top = (t * 100).toFixed(2);
-    const width = ((r - l) * 100).toFixed(2);
-    const height = ((b - t) * 100).toFixed(2);
-    const cls = mode === 'modal'
-      ? 'border-2 border-amber-400/90 bg-amber-300/15'
-      : 'border border-amber-400/90 bg-amber-300/20';
-
-    return `<div class="absolute ${cls} rounded-sm" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%;"></div>`;
-  }).join('');
-}
-
-function getEvidenceSnippet(ev) {
-  if (!ev || !Array.isArray(ev.regions) || ev.regions.length === 0) return '';
-  const best = [...ev.regions]
-    .filter(r => typeof r.text === 'string')
-    .sort((a, b) => (Number(b.region_score) || 0) - (Number(a.region_score) || 0))[0];
-  return best && best.text ? escapeHtml(best.text) : '';
-}
-
-function getEvidenceAspectRatio(ev) {
-  if (!ev || !Array.isArray(ev.image_size) || ev.image_size.length !== 2) return '4 / 3';
-  const w = Number(ev.image_size[0]);
-  const h = Number(ev.image_size[1]);
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return '4 / 3';
-  return `${w} / ${h}`;
-}
-
 function escapeHtml(text) {
   return String(text)
     .replace(/&/g, '&amp;')
@@ -438,27 +448,17 @@ function addAssistantMessage(markdownText, evidences = []) {
   if (evidences && evidences.length > 0) {
     let cards = evidences.map(ev => {
       const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
-      const encodedRegions = encodeRegions(ev.regions || []);
-      const overlayHtml = buildRegionOverlay(ev.regions || [], 'card');
-      const snippet = getEvidenceSnippet(ev);
-      const regionCount = Array.isArray(ev.regions) ? ev.regions.length : 0;
-      const evidenceKind = regionCount > 0 ? `高亮区域 ${regionCount}` : '整页';
-      const aspectRatio = getEvidenceAspectRatio(ev);
       return `
-      <div class="snap-start shrink-0 w-[150px] md:w-[170px] bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}', '${encodedRegions}')">
-        <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: ${aspectRatio};">
+      <div class="w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}')">
+        <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: 4/3;">
           <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
-          <div class="absolute inset-0 pointer-events-none">
-            ${overlayHtml}
-          </div>
           <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 dark:group-hover:bg-white/10 transition-colors flex items-center justify-center">
             <svg class="w-6 h-6 text-white opacity-0 group-hover:opacity-100 transition-opacity drop-shadow-md" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
           </div>
         </div>
         <div class="p-2.5">
           <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
-          <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} • ${evidenceKind}</p>
-          <p class="text-[11px] text-[#a0a4aa] dark:text-slate-500 mt-1 line-clamp-2 leading-snug">${snippet || `Score: ${ev.score.toFixed(2)}`}</p>
+          <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} · ${ev.score.toFixed(2)}</p>
         </div>
       </div>
     `}).join('');
@@ -466,7 +466,7 @@ function addAssistantMessage(markdownText, evidences = []) {
     evHTML = `
       <div class="mt-3 w-full">
         <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-2 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
-        <div class="flex gap-3 overflow-x-auto pb-4 snap-x pr-4 hide-scrollbar">
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
           ${cards}
         </div>
       </div>
@@ -558,6 +558,7 @@ async function initApp() {
     console.error(err);
   }
   updateInputState(uploadedDocs.length);
+  renderScopeBar();
 }
 
 initApp();

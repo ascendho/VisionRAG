@@ -294,6 +294,8 @@ class VisionVectorStore:
         # 同样执行防御性维度重塑 (Defensive Reshape)，防止一维铺平错误
         query_colpali_2d = query_colpali.reshape(-1, 128)
         query_muvera_2d = query_muvera.reshape(-1, 16)
+        # 归一化因子：查询 token 数量，使分数落入 [0, 1] 区间，消除查询长度对阈值的影响
+        n_query_tokens = max(query_colpali_2d.shape[0], 1)
 
         query_filter = self._build_document_filter(document_ids)
 
@@ -329,7 +331,7 @@ class VisionVectorStore:
             unique.append(
                 {
                     "image_path": payload.get("image_path", ""),
-                    "score": point.score,
+                    "score": point.score / n_query_tokens,
                     "document_id": payload.get("document_id", ""),
                     "document_name": payload.get("document_name", ""),
                     "page_number": payload.get("page_number", 0),

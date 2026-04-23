@@ -7,9 +7,8 @@ import shutil
 import tempfile
 import glob
 
-from src.pdf_processor import process_pdf_to_images, get_file_hash
+from src.pdf_processor import process_pdf_to_images, process_image_to_images, process_text_to_images, get_file_hash
 from src.llm_generator import generate_answer_with_vision
-from src.evidence_localizer import extract_and_cache_page_regions, build_localized_evidences
 
 router = APIRouter()
 
@@ -18,33 +17,68 @@ class ChatRequest(BaseModel):
     query: str
     document_ids: Optional[List[str]] = None
     chat_history: Optional[List[dict]] = None
-    top_k: int = 3
+    top_k: int = 5
+    min_score: float = 0.6
+
+
+def _rebuild_image_cache_if_needed(results: list) -> None:
+    """
+    检查检索结果中的图像缓存文件是否存在（系统重启后 /tmp 会被清空）。
+    若缺失，则从 qdrant_local/pdfs/ 中找到对应 PDF 并重新渲染图像缓存。
+    """
+    missing_doc_ids: dict = {}
+    for r in results:
+        image_path = str(r.get("image_path", ""))
+        if image_path and not os.path.exists(image_path):
+            doc_id = r.get("document_id", "")
+            if doc_id and doc_id not in missing_doc_ids:
+                missing_doc_ids[doc_id] = r.get("document_name", doc_id)
+
+    if not missing_doc_ids:
+        return
+
+    pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+    for doc_id, doc_name in missing_doc_ids.items():
+        matches = glob.glob(os.path.join(pdfs_dir, f"{doc_id}_*"))
+        file_path = matches[0] if matches else None
+        if not file_path or not os.path.exists(file_path):
+            print(f"[Warning] File not found for document '{doc_name}' ({doc_id}), cannot rebuild image cache.")
+            continue
+        print(f"[Info] Rebuilding image cache for: {doc_name}")
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == ".pdf":
+                process_pdf_to_images(file_path)
+            elif ext in {".txt", ".md"}:
+                process_text_to_images(file_path)
+            else:
+                process_image_to_images(file_path)
+        except Exception as rebuild_err:
+            print(f"[Warning] Failed to rebuild cache for {doc_name}: {rebuild_err}")
+
 
 @router.get("/files/{document_id}/download")
 def download_pdf(document_id: str):
     """
-    Download the original PDF file.
+    Download the original file (PDF or image).
     """
     pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-    pattern = os.path.join(pdfs_dir, f"{document_id}_*.pdf")
-    matches = glob.glob(pattern)
+    matches = glob.glob(os.path.join(pdfs_dir, f"{document_id}_*"))
     
-    fallback_path = os.path.join(pdfs_dir, f"{document_id}.pdf")
-    
-    pdf_path = None
-    if matches:
-        pdf_path = matches[0]
-    elif os.path.exists(fallback_path):
-        pdf_path = fallback_path
+    file_path = matches[0] if matches else None
         
-    if not pdf_path:
+    if not file_path:
         raise HTTPException(status_code=404, detail="File not found")
         
-    filename = os.path.basename(pdf_path)
+    filename = os.path.basename(file_path)
+    ext = os.path.splitext(filename)[1].lower()
+    mime_map = {".pdf": "application/pdf", ".png": "image/png",
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+    mime = mime_map.get(ext, "application/octet-stream")
     
     return FileResponse(
-        pdf_path, 
-        media_type="application/pdf", 
+        file_path, 
+        media_type=mime, 
         content_disposition_type="inline", 
         filename=filename
     )
@@ -77,27 +111,24 @@ def delete_file(document_id: str):
         vector_store_instance.delete_document(document_id)
         
         pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-        pattern = os.path.join(pdfs_dir, f"{document_id}_*.pdf")
-        for m in glob.glob(pattern):
+        for m in glob.glob(os.path.join(pdfs_dir, f"{document_id}_*")):
             os.remove(m)
-            
-        fallback_path = os.path.join(pdfs_dir, f"{document_id}.pdf")
-        if os.path.exists(fallback_path):
-            os.remove(fallback_path)
             
         return {"status": "success", "message": f"Document {document_id} deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".txt", ".md"}
+
 @router.post("/upload")
-def upload_pdf(file: UploadFile = File(...)):
+def upload_file(file: UploadFile = File(...)):
     """
-    接收 PDF 并处理为其页面缓存与特征。
+    接收 PDF 或图片文件，处理为页面缓存与向量特征。
+    支持格式：PDF / PNG / JPG / JPEG / WEBP
     """
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="请上传 PDF 格式文件")
-        
-    suffix = os.path.splitext(file.filename)[1] or ".pdf"
+    suffix = os.path.splitext(file.filename)[1].lower() if file.filename else ""
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="请上传支持的文件格式（PDF / PNG / JPG / WEBP / TXT / MD）")
     tmp = tempfile.NamedTemporaryFile(prefix="rag_upload_", suffix=suffix, delete=False)
     temp_path = tmp.name
     tmp.close()
@@ -106,17 +137,17 @@ def upload_pdf(file: UploadFile = File(...)):
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        # 1. 解析 PDF 到图像缓存
-        image_paths = process_pdf_to_images(temp_path)
+        # 1. 解析文件到图像缓存
+        if suffix == ".pdf":
+            image_paths = process_pdf_to_images(temp_path)
+        elif suffix in {".txt", ".md"}:
+            image_paths = process_text_to_images(temp_path)
+        else:
+            image_paths = process_image_to_images(temp_path)
         
         if not image_paths:
             raise HTTPException(status_code=500, detail="未能成功解析出任何页面图像")
 
-        try:
-            extract_and_cache_page_regions(temp_path, image_paths)
-        except Exception as region_err:
-            print(f"[Warning] 页面区域提取失败，将回退到整页证据: {region_err}")
-            
         file_hash = get_file_hash(temp_path)
         safe_filename = file.filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
         
@@ -176,33 +207,36 @@ def chat(req: ChatRequest):
             top_k=req.top_k
         )
         
-        localized_evidences = build_localized_evidences(req.query, results)
-        evidence_images = [evidence["image_path"] for evidence in localized_evidences if evidence.get("image_path")]
+        _rebuild_image_cache_if_needed(results)
+        # 按分数阈值过滤：保留分数足够高的页面，至少保留第一条（防止空响应）
+        score_filtered = [r for r in results if float(r.get("score", 0)) >= req.min_score]
+        if not score_filtered and results:
+            score_filtered = results[:1]
+        # 过滤掉图像文件仍缺失的证据（PDF 也无法找到时的兜底）
+        valid_results = [r for r in score_filtered if os.path.exists(str(r.get("image_path", "")))]
+        evidence_images = [r["image_path"] for r in valid_results if r.get("image_path")]
 
         if not evidence_images:
             return {
                 "answer": "抱歉，向量库中未能检索出与该片段高度匹配的页面。",
                 "evidences": []
             }
-            
-        # 2. 生成多模态 RAG 答案
+
+        # 2. 生成 LLM 答案
         answer_text = generate_answer_with_vision(
             query_text=req.query,
             image_paths=evidence_images
         )
 
         frontend_evidences = []
-        for evidence in localized_evidences:
-            image_path = evidence.get("image_path", "")
+        for r in valid_results:
+            image_path = str(r.get("image_path", ""))
             if not image_path:
                 continue
             frontend_evidences.append({
-                "document_name": evidence.get("document_name", "Unknown File"),
-                "page_number": evidence.get("page_number", 0),
-                "score": float(evidence.get("score", 0.0)),
-                "image_kind": evidence.get("image_kind", "page"),
-                "image_size": evidence.get("image_size", []),
-                "regions": evidence.get("regions", []),
+                "document_name": r.get("document_name", "Unknown File"),
+                "page_number": r.get("page_number", 0),
+                "score": float(r.get("score", 0.0)),
                 "image_base64": image_path_to_base64(image_path)
             })
         
