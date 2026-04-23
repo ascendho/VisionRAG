@@ -9,7 +9,7 @@ vector_store_instance = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from src.pdf_processor import clear_all_caches
+    from src.doc_processor import clear_all_caches
     from src.vector_store import VisionVectorStore
 
     # 启动时只做模型与向量库初始化，不主动清空业务数据，避免 --reload 模式下频繁重启导致数据丢失。

@@ -3,6 +3,7 @@ let uploadedDocs = [];
 let isUploading = false;
 let isChatting = false;
 let selectedDocIds = null; // null = 全部文档；array of IDs = 当前选中的范围
+let conversationHistory = []; // Multi-turn memory
 
 // Elements
 const bottomFileInput = document.getElementById('bottomFileInput');
@@ -107,26 +108,31 @@ function getFileIcon(filename) {
 function renderScopeBar() {
   const bar = document.getElementById('scopeBar');
   if (!bar) return;
-  if (uploadedDocs.length <= 1) {
+  if (uploadedDocs.length === 0) {
     bar.classList.add('hidden');
     return;
   }
   bar.classList.remove('hidden');
   const allActive = selectedDocIds === null;
+  // Only show "全部" chip when there are 2+ docs
   const chips = [
-    `<button onclick="selectScope(null)" class="px-3 py-1 rounded-full text-[12px] font-medium border transition-colors ${
+    ...(uploadedDocs.length >= 2 ? [`<button onclick="selectScope(null)" class="px-3 py-1 rounded-full text-[12px] font-medium border transition-colors ${
       allActive
         ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-600'
         : 'bg-white dark:bg-slate-800 text-[#444746] dark:text-slate-400 border-gray-200 dark:border-slate-600 hover:border-blue-300'
-    }">全部</button>`,
+    }">全部</button>`] : []),
     ...uploadedDocs.map(doc => {
       const isActive = Array.isArray(selectedDocIds) && selectedDocIds.includes(doc.document_id);
-      const label = doc.document_name.length > 20 ? doc.document_name.slice(0, 18) + '…' : doc.document_name;
-      return `<button onclick="selectScope('${doc.document_id}')" title="${doc.document_name}" class="px-3 py-1 rounded-full text-[12px] font-medium border transition-colors ${
-        isActive
-          ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-600'
-          : 'bg-white dark:bg-slate-800 text-[#444746] dark:text-slate-400 border-gray-200 dark:border-slate-600 hover:border-blue-300'
-      }">${label}</button>`;
+      const label = doc.document_name.length > 18 ? doc.document_name.slice(0, 16) + '…' : doc.document_name;
+      const chipBase = isActive
+        ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-600'
+        : 'bg-white dark:bg-slate-800 text-[#444746] dark:text-slate-400 border-gray-200 dark:border-slate-600 hover:border-blue-300';
+      return `<span id="chip-${doc.document_id}" class="inline-flex items-center gap-1 pl-3 pr-1 py-1 rounded-full text-[12px] font-medium border transition-colors ${chipBase}">
+        <span onclick="selectScope('${doc.document_id}')" title="${doc.document_name}" class="cursor-pointer">${label}</span>
+        <button id="chip-del-${doc.document_id}" onclick="deleteScopeChip('${doc.document_id}', event)" title="删除文档" class="w-4 h-4 flex items-center justify-center rounded-full hover:bg-red-100 dark:hover:bg-red-900/40 hover:text-red-500 dark:hover:text-red-400 transition-colors text-current opacity-60 hover:opacity-100">
+          <svg class="w-2.5 h-2.5" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg>
+        </button>
+      </span>`;
     })
   ];
   bar.innerHTML = chips.join('');
@@ -153,6 +159,30 @@ function selectScope(docId) {
     }
   }
   renderScopeBar();
+}
+
+async function deleteScopeChip(docId, e) {
+  e.stopPropagation();
+  const btn = document.getElementById('chip-del-' + docId);
+  if (btn) btn.innerHTML = `<div class="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin"></div>`;
+  try {
+    const res = await fetch('/api/rag/files/' + docId, { method: 'DELETE' });
+    if (res.ok) {
+      uploadedDocs = uploadedDocs.filter(d => d.document_id !== docId);
+      if (Array.isArray(selectedDocIds)) {
+        const next = selectedDocIds.filter(id => id !== docId);
+        selectedDocIds = next.length === 0 ? null : next;
+      }
+      updateInputState(uploadedDocs.length);
+      renderScopeBar();
+    } else {
+      if (btn) btn.innerHTML = `<svg class="w-2.5 h-2.5" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg>`;
+      alert('删除失败');
+    }
+  } catch (err) {
+    if (btn) btn.innerHTML = `<svg class="w-2.5 h-2.5" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg>`;
+    alert('网络错误');
+  }
 }
 
 async function openFilesModal() {
@@ -268,16 +298,26 @@ function showUploadingAnimation(text) {
           <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
         </svg>
       </div>
-      <div class="px-5 flex items-center justify-center gap-1.5 h-[32px] mt-1 relative">
-        <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.3s"></div>
-        <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.15s"></div>
-        <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce"></div>
-        <span class="ml-3 text-[14px] font-medium text-[#444746] dark:text-slate-300">${text || '正在提取与建立索引...'}</span>
+      <div class="flex flex-col justify-center gap-1.5 mt-1">
+        <div class="px-5 flex items-center gap-1.5 h-[32px] relative">
+          <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.3s"></div>
+          <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.15s"></div>
+          <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce"></div>
+          <span class="ml-3 text-[14px] font-medium text-[#444746] dark:text-slate-300">${text || '正在提取与建立索引...'}</span>
+        </div>
+        <div class="mx-5 h-1 w-48 bg-gray-200 dark:bg-slate-700 rounded-full overflow-hidden">
+          <div id="upload-progress-fill-${id}" class="h-full bg-blue-500 rounded-full transition-all duration-200" style="width: 0%"></div>
+        </div>
       </div>
     </div>
   `;
-  scrollToBottom();
+  requestAnimationFrame(() => scrollToBottom());
   return id;
+}
+
+function updateUploadProgress(loadId, ratio) {
+  const fill = document.getElementById('upload-progress-fill-' + loadId);
+  if (fill) fill.style.width = Math.min(100, Math.round(ratio * 100)) + '%';
 }
 
 async function handleUpload(file) {
@@ -288,19 +328,36 @@ async function handleUpload(file) {
   
   const formData = new FormData();
   formData.append('file', file);
-  
+
   try {
-    const res = await fetch('/api/rag/upload', { method: 'POST', body: formData });
-    const data = await res.json();
-    
+    const data = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/rag/upload');
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) updateUploadProgress(loadId, e.loaded / e.total);
+      });
+      xhr.addEventListener('load', () => {
+        try { resolve({ status: xhr.status, body: JSON.parse(xhr.responseText) }); }
+        catch { resolve({ status: xhr.status, body: { detail: xhr.responseText } }); }
+      });
+      xhr.addEventListener('error', () => reject(new Error('网络错误')));
+      xhr.send(formData);
+    });
+
+    // Snap progress to 100% before removing the loader
+    updateUploadProgress(loadId, 1);
+
     removeLoading(loadId);
-    if (res.ok) {
-      uploadedDocs.push(data);
+    if (data.status === 200) {
+      uploadedDocs.push(data.body);
       if(typeof updateInputState === 'function') updateInputState(uploadedDocs.length);
       renderScopeBar();
-      addAssistantMessage(`✅ **${data.document_name}** 已成功上传并建立索引。现在，您可以就此文档向我提问了！`);
+      // 若"已加载文档"弹窗此时处于打开状态，自动刷新列表无需用户手动关闭重开
+      const _fm = document.getElementById('filesModal');
+      if (_fm && !_fm.classList.contains('hidden')) openFilesModal();
+      addAssistantMessage(`✅ **${data.body.document_name}** 已成功上传并建立索引。现在，您可以就此文档向我提问了！`);
     } else {
-      addAssistantMessage(`❌ 上传失败: ${data.detail}`);
+      addAssistantMessage(`❌ 上传失败: ${data.body.detail}`);
     }
   } catch (err) {
     removeLoading(loadId);
@@ -324,7 +381,6 @@ async function handleChat(fromHistory = false) {
     history.pushState({view: 'chat'}, '', '#chat');
   }
 
-  // Hide welcome, show chat and transition UI
   welcomeScreen.classList.add("hidden");
   chatHistory.classList.remove("hidden");
   inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
@@ -338,27 +394,96 @@ async function handleChat(fromHistory = false) {
   }
   
   isChatting = true;
-  
   const loadId = showLoading();
 
   try {
-    // Omitting document_ids means global search across all uploaded docs!
     const res = await fetch('/api/rag/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text, top_k: 5, ...(selectedDocIds ? { document_ids: selectedDocIds } : {}) }) 
+      body: JSON.stringify({
+        query: text,
+        top_k: 5,
+        chat_history: conversationHistory,
+        ...(selectedDocIds ? { document_ids: selectedDocIds } : {})
+      })
     });
-    const data = await res.json();
-    removeLoading(loadId);
-    
-    if (res.ok) {
-      addAssistantMessage(data.answer, data.evidences);
-    } else {
-      addAssistantMessage(`❌ Error: ${data.detail}`);
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({ detail: res.statusText }));
+      removeLoading(loadId);
+      addAssistantMessage(`❌ Error: ${errData.detail}`);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let answerText = '';
+    let msgId = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // retain incomplete last line
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+
+        if (raw === '[DONE]') {
+          if (msgId) {
+            // Remove typing cursor
+            const cursor = document.getElementById('cursor-' + msgId);
+            if (cursor) cursor.remove();
+            // Add copy button
+            const actionsEl = document.getElementById('stream-actions-' + msgId);
+            if (actionsEl) {
+              const escaped = answerText.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');
+              actionsEl.innerHTML = `<button onclick="navigator.clipboard.writeText('${escaped}'); const i=this.querySelector('svg'); const old=i.innerHTML; i.innerHTML='<polyline points=\\'20 6 9 17 4 12\\'></polyline>'; setTimeout(()=>i.innerHTML=old,1500);" class="p-1.5 text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors flex items-center gap-1.5 text-xs font-medium" title="复制结果"><svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg><span>复制</span></button>`;
+              actionsEl.classList.remove('opacity-0');
+              actionsEl.classList.add('opacity-0'); // stays hidden until hover via group
+            }
+            // Save multi-turn history (cap at 20 messages = 10 turns)
+            conversationHistory.push({ role: 'user', content: text });
+            conversationHistory.push({ role: 'assistant', content: answerText });
+            if (conversationHistory.length > 20) {
+              conversationHistory = conversationHistory.slice(conversationHistory.length - 20);
+            }
+          }
+          break;
+        }
+
+        let event;
+        try { event = JSON.parse(raw); } catch { continue; }
+
+        if (event.type === 'error') {
+          removeLoading(loadId);
+          addAssistantMessage(event.data);
+          return;
+        }
+
+        if (event.type === 'evidences') {
+          removeLoading(loadId);
+          msgId = 'msg-' + Date.now();
+          _insertStreamingShell(msgId, event.data.evidences, event.data.all_candidates);
+        }
+
+        if (event.type === 'token' && msgId) {
+          answerText += event.data;
+          const answerEl = document.getElementById('stream-answer-' + msgId);
+          if (answerEl) {
+            answerEl.innerHTML = marked.parse(answerText) +
+              `<span id="cursor-${msgId}" class="inline-block w-[2px] h-[1.1em] bg-current align-middle ml-0.5 animate-pulse opacity-70"></span>`;
+          }
+          scrollToBottom();
+        }
+      }
     }
   } catch (err) {
     removeLoading(loadId);
-    addAssistantMessage(`❌ Network error getting answer.`);
+    addAssistantMessage(`❌ 网络错误，请重试。`);
   } finally {
     isChatting = false;
   }
@@ -388,6 +513,7 @@ function resetUI(fromHistory = false) {
   queryInput.value = "";
   isChatting = false;
   isUploading = false;
+  conversationHistory = [];
 }
 
 window.addEventListener('popstate', (e) => {
@@ -440,15 +566,11 @@ function addUserMessage(text) {
   scrollToBottom();
 }
 
-function addAssistantMessage(markdownText, evidences = []) {
-  welcomeScreen.classList.add("hidden");
-  chatHistory.classList.remove("hidden");
-
-  let evHTML = "";
-  if (evidences && evidences.length > 0) {
-    let cards = evidences.map(ev => {
-      const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
-      return `
+function _buildEvidenceCards(evidences, allCandidates) {
+  if (!evidences || evidences.length === 0) return '';
+  const cards = evidences.map(ev => {
+    const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
+    return `
       <div class="w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}')">
         <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: 4/3;">
           <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
@@ -460,18 +582,78 @@ function addAssistantMessage(markdownText, evidences = []) {
           <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
           <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} · ${ev.score.toFixed(2)}</p>
         </div>
-      </div>
-    `}).join('');
+      </div>`;
+  }).join('');
 
-    evHTML = `
-      <div class="mt-3 w-full">
-        <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-2 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
-        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">
-          ${cards}
-        </div>
-      </div>
-    `;
+  // 未被采用的候选页（得分不足 min_score 或排名靠后）
+  const unused = (allCandidates || []).filter(c => !c.is_used);
+  let disclosureHtml = '';
+  if (unused.length > 0) {
+    const toggleId = 'all-cands-' + Date.now();
+    const unusedCards = unused.map(ev => {
+      const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
+      return `
+        <div class="w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group opacity-50 hover:opacity-80" onclick="openImageModal('${imgSrc}')">
+          <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: 4/3;">
+            <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
+            <div class="absolute top-1.5 left-1.5">
+              <span class="text-[10px] bg-[#e8eaed] dark:bg-slate-700 text-[#80868b] dark:text-slate-400 px-1.5 py-0.5 rounded-full font-medium">未采用</span>
+            </div>
+          </div>
+          <div class="p-2.5">
+            <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
+            <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} · ${ev.score.toFixed(2)}</p>
+          </div>
+        </div>`;
+    }).join('');
+    disclosureHtml = `
+      <div class="mt-2 w-full">
+        <button onclick="(function(btn){var grid=document.getElementById('${toggleId}');var isHidden=grid.style.display==='none';grid.style.display=isHidden?'grid':'none';btn.querySelector('svg').style.transform=isHidden?'rotate(180deg)':''})(this)" class="flex items-center gap-1.5 text-[11px] font-semibold text-[#80868b] dark:text-slate-400 hover:text-[#4285f4] dark:hover:text-blue-400 transition-colors mb-2 pl-1 uppercase tracking-wider">
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 transition-transform duration-200" style="transform:none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          查看全部候选页 (${unused.length} 未采用)
+        </button>
+        <div id="${toggleId}" style="display:none" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">${unusedCards}</div>
+      </div>`;
   }
+
+  return `
+    <div class="mt-3 w-full">
+      <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-2 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
+      <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">${cards}</div>
+      ${disclosureHtml}
+    </div>`;
+}
+
+function _insertStreamingShell(msgId, evidences, allCandidates) {
+  const evHTML = _buildEvidenceCards(evidences, allCandidates);
+  chatHistory.innerHTML += `
+    <div id="${msgId}" class="flex gap-4 flex-row group">
+      <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
+        <svg class="w-6 h-6 outline-none" fill="#4285f4" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+        </svg>
+      </div>
+      <div class="flex flex-col gap-1 items-start w-full">
+        <div id="stream-answer-${msgId}" class="text-[16px] leading-[1.8] text-[#1f1f1f] dark:text-slate-200 w-full markdown-body">
+          <div id="stream-thinking-${msgId}" class="flex items-center gap-1.5 py-1">
+            <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce" style="animation-delay:-0.3s"></div>
+            <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce" style="animation-delay:-0.15s"></div>
+            <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce"></div>
+            <span class="ml-1 text-[13px] text-[#80868b] dark:text-slate-400">正在生成回答...</span>
+          </div>
+        </div>
+        ${evHTML}
+        <div id="stream-actions-${msgId}" class="flex gap-2 ml-2 opacity-0 group-hover:opacity-100 transition-opacity items-center mt-1"></div>
+      </div>
+    </div>`;
+  scrollToBottom();
+}
+
+function addAssistantMessage(markdownText, evidences = []) {
+  welcomeScreen.classList.add("hidden");
+  chatHistory.classList.remove("hidden");
+
+  const evHTML = _buildEvidenceCards(evidences);
 
   const htmlContent = marked.parse(markdownText);
   const escapedMd = markdownText.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');

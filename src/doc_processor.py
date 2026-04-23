@@ -70,7 +70,7 @@ def get_file_hash(file_path: str) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def process_pdf_to_images(pdf_path: str, dpi: int = 300) -> List[str]:
+def process_pdf_to_images(pdf_path: str, dpi: int = 150) -> List[str]:
     """
     将 PDF 文件的每一页分别转为高质量 PNG 截图并保存到缓存目录。
     这个步骤是整个多模态 RAG 流程的基石：
@@ -79,7 +79,9 @@ def process_pdf_to_images(pdf_path: str, dpi: int = 300) -> List[str]:
     
     参数:
         pdf_path (str): PDF 文件的绝对/相对路径。
-        dpi (int): 分辨率（默认为300），越高图像越清晰，但处理时间、文件大小会明显增大。
+        dpi (int): 分辨率（默认为150）。ColPali 推理前将图像固定 resize 到 448×448，
+                   300 DPI 的像素（2480×3508）完全超出模型所需，检索质量与 150 DPI 等同；
+                   150 DPI（1240×1754）在前端全屏查看时仍清晰可读，同时渲染速度约快 2×、缓存体积约小 75%。
         
     返回:
         List[str]: 所有页面对应的图片保存路径列表。

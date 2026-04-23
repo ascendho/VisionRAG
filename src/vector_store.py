@@ -32,7 +32,7 @@ class VisionVectorStore:
             dim=128,          # ColPali 原始维度 128
             k_sim=6,          # 聚类数目 (2^6 = 64 clusters)
             dim_proj=16,      # 每一簇压缩至 16 维
-            r_reps=20,        # 重复 20 次随机投影
+            r_reps=30,        # 重复 30 次随机投影（提升 Stage 1 近似精度，CPU 侧额外开销 <3ms）
             random_seed=42,   # 固定随机种子确保线上复现性
         )
         
@@ -224,10 +224,14 @@ class VisionVectorStore:
         if not points:
             return False
 
-        self.qdrant.upsert(
-            collection_name=COLLECTION_NAME,
-            points=points
-        )
+        # 分批 upsert，每批 8 个点，避免单次请求体超过 Qdrant 默认 32MB 上限
+        # 每页向量 JSON 约 1.94 MB（original 1.57 MB + muvera 0.37 MB），8 页 ≈ 15.5 MB，留足余量
+        upsert_batch_size = 8
+        for i in range(0, len(points), upsert_batch_size):
+            self.qdrant.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points[i:i + upsert_batch_size]
+            )
         return True
 
     def get_all_documents(self) -> List[Dict[str, Any]]:
@@ -264,7 +268,7 @@ class VisionVectorStore:
         self,
         query_text: str,
         top_k: int = 3,
-        prefetch_multiplier: int = 5,
+        prefetch_multiplier: int = 10,
         document_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """

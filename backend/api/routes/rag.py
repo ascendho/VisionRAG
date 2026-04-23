@@ -1,14 +1,15 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import os
+import json
 import shutil
 import tempfile
 import glob
 
-from src.pdf_processor import process_pdf_to_images, process_image_to_images, process_text_to_images, get_file_hash
-from src.llm_generator import generate_answer_with_vision
+from src.doc_processor import process_pdf_to_images, process_image_to_images, process_text_to_images, get_file_hash
+from src.llm_generator import generate_answer_stream
 
 router = APIRouter()
 
@@ -192,60 +193,80 @@ def upload_file(file: UploadFile = File(...)):
 @router.post("/chat")
 def chat(req: ChatRequest):
     """
-    接收对某几篇（或全部）文档的查询，
-    进行两阶段召回后使用豆包生成答案，返回文字回答以及匹配到的页面图片（供溯源）。
+    接收对某几篇（或全部）文档的查询，通过 SSE 流式返回：
+    第一个事件为 evidence 卡片数据，后续事件为逐 token 文字，最终发送 [DONE]。
     """
-    try:
-        from backend.main import vector_store_instance
-        if vector_store_instance is None:
-            raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
-            
-        # 1. RAG 图像双路检索
-        results = vector_store_instance.retrieve_with_two_stage(
-            query_text=req.query,
-            document_ids=req.document_ids,
-            top_k=req.top_k
-        )
-        
-        _rebuild_image_cache_if_needed(results)
-        # 按分数阈值过滤：保留分数足够高的页面，至少保留第一条（防止空响应）
-        score_filtered = [r for r in results if float(r.get("score", 0)) >= req.min_score]
-        if not score_filtered and results:
-            score_filtered = results[:1]
-        # 过滤掉图像文件仍缺失的证据（PDF 也无法找到时的兜底）
-        valid_results = [r for r in score_filtered if os.path.exists(str(r.get("image_path", "")))]
-        evidence_images = [r["image_path"] for r in valid_results if r.get("image_path")]
+    from backend.main import vector_store_instance
+    if vector_store_instance is None:
+        raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
 
+    # ── 同步完成 RAG 检索（流式响应开始前必须就绪）──
+    results = vector_store_instance.retrieve_with_two_stage(
+        query_text=req.query,
+        document_ids=req.document_ids,
+        top_k=req.top_k
+    )
+
+    _rebuild_image_cache_if_needed(results)
+    score_filtered = [r for r in results if float(r.get("score", 0)) >= req.min_score]
+    if not score_filtered and results:
+        score_filtered = results[:1]
+    valid_results = [r for r in score_filtered if os.path.exists(str(r.get("image_path", "")))]
+    evidence_images = [r["image_path"] for r in valid_results if r.get("image_path")]
+
+    used_keys = {(r.get("document_id", ""), r.get("page_number", -1)) for r in valid_results}
+    frontend_evidences = []
+    for r in valid_results:
+        image_path = str(r.get("image_path", ""))
+        if not image_path:
+            continue
+        frontend_evidences.append({
+            "document_name": r.get("document_name", "Unknown File"),
+            "page_number": r.get("page_number", 0),
+            "score": float(r.get("score", 0.0)),
+            "image_base64": image_path_to_base64(image_path)
+        })
+
+    # 全部候选页（top_k 个，含未被 min_score 采用的），供前端展示所有得分
+    all_candidates_fe = []
+    for r in results:
+        image_path = str(r.get("image_path", ""))
+        if not image_path:
+            continue
+        key = (r.get("document_id", ""), r.get("page_number", -1))
+        all_candidates_fe.append({
+            "document_name": r.get("document_name", "Unknown File"),
+            "page_number": r.get("page_number", 0),
+            "score": float(r.get("score", 0.0)),
+            "image_base64": image_path_to_base64(image_path),
+            "is_used": key in used_keys,
+        })
+
+    def event_stream():
+        # ── 事件 1: 证据卡片 ──
         if not evidence_images:
-            return {
-                "answer": "抱歉，向量库中未能检索出与该片段高度匹配的页面。",
-                "evidences": []
-            }
+            yield f"data: {json.dumps({'type': 'error', 'data': '抱歉，未能检索出与该问题高度匹配的页面。'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
-        # 2. 生成 LLM 答案
-        answer_text = generate_answer_with_vision(
+        yield f"data: {json.dumps({'type': 'evidences', 'data': {'evidences': frontend_evidences, 'all_candidates': all_candidates_fe}})}\n\n"
+
+        # ── 事件 2..N: 逐 token 文字 ──
+        for token in generate_answer_stream(
             query_text=req.query,
-            image_paths=evidence_images
-        )
+            image_paths=evidence_images,
+            chat_history=req.chat_history,
+        ):
+            yield f"data: {json.dumps({'type': 'token', 'data': token})}\n\n"
 
-        frontend_evidences = []
-        for r in valid_results:
-            image_path = str(r.get("image_path", ""))
-            if not image_path:
-                continue
-            frontend_evidences.append({
-                "document_name": r.get("document_name", "Unknown File"),
-                "page_number": r.get("page_number", 0),
-                "score": float(r.get("score", 0.0)),
-                "image_base64": image_path_to_base64(image_path)
-            })
-        
-        return {
-            "answer": answer_text,
-            "evidences": frontend_evidences
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # ── 结束哨兵 ──
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 def image_path_to_base64(image_path: str) -> str:
     import base64
@@ -253,7 +274,6 @@ def image_path_to_base64(image_path: str) -> str:
         return ""
     with open(image_path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode('utf-8')
-    # 根据后缀决定 mimetype
     mime = "image/png"
     if image_path.lower().endswith(('.jpg', '.jpeg')):
         mime = "image/jpeg"
