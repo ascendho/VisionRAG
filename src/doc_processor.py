@@ -1,8 +1,9 @@
 import os
 import shutil
 import hashlib
+import time
 import textwrap
-from typing import List
+from typing import Any, Dict, List, Tuple, Union
 from PIL import Image, ImageDraw, ImageFont
 from pdf2image import convert_from_path
 from src.config import IMAGE_CACHE_DIR
@@ -70,7 +71,22 @@ def get_file_hash(file_path: str) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
-def process_pdf_to_images(pdf_path: str, dpi: int = 150) -> List[str]:
+
+def _list_cached_page_images(doc_cache_dir: str) -> List[str]:
+    """返回缓存目录中已存在的页图像，按页码顺序排序。"""
+    image_names = [
+        name for name in os.listdir(doc_cache_dir)
+        if name.startswith("page_") and name.endswith(".png")
+    ]
+    image_names.sort(key=lambda name: int(name.removeprefix("page_").removesuffix(".png")))
+    return [os.path.join(doc_cache_dir, name) for name in image_names]
+
+
+def process_pdf_to_images(
+    pdf_path: str,
+    dpi: int = 150,
+    return_timing: bool = False,
+) -> Union[List[str], Tuple[List[str], Dict[str, Any]]]:
     """
     将 PDF 文件的每一页分别转为高质量 PNG 截图并保存到缓存目录。
     这个步骤是整个多模态 RAG 流程的基石：
@@ -82,34 +98,64 @@ def process_pdf_to_images(pdf_path: str, dpi: int = 150) -> List[str]:
         dpi (int): 分辨率（默认为150）。ColPali 推理前将图像固定 resize 到 448×448，
                    300 DPI 的像素（2480×3508）完全超出模型所需，检索质量与 150 DPI 等同；
                    150 DPI（1240×1754）在前端全屏查看时仍清晰可读，同时渲染速度约快 2×、缓存体积约小 75%。
+        return_timing (bool): 为 True 时，额外返回渲染计时与缓存命中信息。
         
     返回:
         List[str]: 所有页面对应的图片保存路径列表。
+        或 (image_paths, timing): 当 return_timing=True 时，返回路径与计时信息。
     """
     file_hash = get_file_hash(pdf_path)
     # 为当前文件创建独立的缓存目录，防止重名污染
     doc_cache_dir = os.path.join(IMAGE_CACHE_DIR, file_hash)
     os.makedirs(doc_cache_dir, exist_ok=True)
+
+    cached_paths = _list_cached_page_images(doc_cache_dir)
+    if cached_paths:
+        if return_timing:
+            return cached_paths, {
+                "cache_mode": "hot",
+                "cache_hit": True,
+                "page_count": len(cached_paths),
+                "pdf_render_ms": 0.0,
+                "cache_write_ms": 0.0,
+                "total_prepare_ms": 0.0,
+            }
+        return cached_paths
     
     try:
+        render_t0 = time.perf_counter()
         # 解析 PDF 得到 PIL 图像对象列表
         # (需要提前在系统安装 poppler，例如 Mac 上运行: brew install poppler)
         pages = convert_from_path(pdf_path, dpi=dpi, fmt="png")
+        render_t1 = time.perf_counter()
     except Exception as e:
         raise RuntimeError(f"PDF 文档 {pdf_path} 读取失败，请检查是否为受损文件或系统是否安装了 poppler. 错误信息: {str(e)}")
 
     image_paths = []
+    write_ms = 0.0
     # 遍历页数，分别存盘。如果检测到本地已有图片缓存则略过，起到提速效果
     for i, page in enumerate(pages):
         image_name = f"page_{i + 1}.png"
         image_path = os.path.join(doc_cache_dir, image_name)
         
         if not os.path.exists(image_path):
+            write_t0 = time.perf_counter()
             page.save(image_path, "PNG")
+            write_ms += (time.perf_counter() - write_t0) * 1000
             
         # 记录图像路径供后续特征提取以及前端查看时使用
         image_paths.append(image_path)
-        
+
+    if return_timing:
+        render_ms = (render_t1 - render_t0) * 1000
+        return image_paths, {
+            "cache_mode": "cold",
+            "cache_hit": False,
+            "page_count": len(image_paths),
+            "pdf_render_ms": round(render_ms, 1),
+            "cache_write_ms": round(write_ms, 1),
+            "total_prepare_ms": round(render_ms + write_ms, 1),
+        }
     return image_paths
 
 

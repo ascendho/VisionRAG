@@ -1,5 +1,6 @@
 import hashlib
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 import warnings
 
 # 过滤并忽略 PyTorch 在部分系统中无伤大雅的类发现警告
@@ -160,8 +161,9 @@ class VisionVectorStore:
         document_name: Optional[str] = None,
         batch_size: int = 4,
         replace_document: bool = True,
+        return_timing: bool = False,
         **_ignored,
-    ) -> bool:
+    ) -> Union[bool, Tuple[bool, Dict[str, Any]]]:
         """
         将转换好的 PDF 每页图片利用 ColPali 模型送入并转为稠密向量，通过 MUVERA 进行压缩扩展，然后写到 Qdrant 中。
         采用分批处理（Batched Processing），防止由于页数太多导致本地显存或系统内存爆炸。
@@ -173,23 +175,34 @@ class VisionVectorStore:
         document_id = document_id or hashlib.sha1("\n".join(image_paths).encode("utf-8")).hexdigest()
         document_name = document_name or document_id
 
+        total_t0 = time.perf_counter()
         if replace_document:
             self.delete_document(document_id)
 
         total_images = len(image_paths)
         points = []
+        embedding_ms = 0.0
+        compression_ms = 0.0
+        upsert_ms = 0.0
+        embedding_batch_ms: List[float] = []
+        compression_page_ms: List[float] = []
+        upsert_batch_ms: List[float] = []
         
         for i in range(0, total_images, batch_size):
             batch_paths = image_paths[i:i + batch_size]
             images = [Image.open(p).convert("RGB") for p in batch_paths]
 
             try:
+                embed_t0 = time.perf_counter()
                 # 将图片信息预处理为 ColPali 模型可接收的格式 (类似 Vit 结合 LLaMA 预处理)
                 batch_inputs = self.processor.process_images(images).to(self.device).to(self.model.dtype)
 
                 with torch.no_grad():
                     # 获取高质量多向量输出
                     image_embeddings = self.model(**batch_inputs)
+                batch_embedding_ms = (time.perf_counter() - embed_t0) * 1000
+                embedding_ms += batch_embedding_ms
+                embedding_batch_ms.append(round(batch_embedding_ms, 1))
             finally:
                 for img in images:
                     img.close()
@@ -200,9 +213,13 @@ class VisionVectorStore:
             for j, (path, original_emb) in enumerate(zip(batch_paths, cpu_embeddings)):
                 # MUVERA 生成的结构可能受输入分辨率或页数影响，变为铺平的一维巨型数组
                 # 所以无论如何都在入库前强制经过防御性重塑 (Defensive Reshape) 到目标列维
+                compression_t0 = time.perf_counter()
                 original_emb_2d = original_emb.reshape(-1, 128)
                 muvera_embRaw = self.muvera.process_document(original_emb)
                 muvera_emb_2d = muvera_embRaw.reshape(-1, 16)
+                page_compression_ms = (time.perf_counter() - compression_t0) * 1000
+                compression_ms += page_compression_ms
+                compression_page_ms.append(round(page_compression_ms, 1))
                 
                 # 使用页码作为稳定索引，避免多文档混写时覆盖。
                 page_number = i + j + 1
@@ -222,16 +239,43 @@ class VisionVectorStore:
                 points.append(point)
                 
         if not points:
+            if return_timing:
+                return False, {
+                    "page_count": total_images,
+                    "embedding_ms": 0.0,
+                    "compression_ms": 0.0,
+                    "upsert_ms": 0.0,
+                    "total_index_ms": round((time.perf_counter() - total_t0) * 1000, 1),
+                    "embedding_batch_ms": [],
+                    "compression_page_ms": [],
+                    "upsert_batch_ms": [],
+                }
             return False
 
         # 分批 upsert，每批 8 个点，避免单次请求体超过 Qdrant 默认 32MB 上限
         # 每页向量 JSON 约 1.94 MB（original 1.57 MB + muvera 0.37 MB），8 页 ≈ 15.5 MB，留足余量
         upsert_batch_size = 8
         for i in range(0, len(points), upsert_batch_size):
+            upsert_t0 = time.perf_counter()
             self.qdrant.upsert(
                 collection_name=COLLECTION_NAME,
                 points=points[i:i + upsert_batch_size]
             )
+            batch_upsert_ms = (time.perf_counter() - upsert_t0) * 1000
+            upsert_ms += batch_upsert_ms
+            upsert_batch_ms.append(round(batch_upsert_ms, 1))
+
+        if return_timing:
+            return True, {
+                "page_count": total_images,
+                "embedding_ms": round(embedding_ms, 1),
+                "compression_ms": round(compression_ms, 1),
+                "upsert_ms": round(upsert_ms, 1),
+                "total_index_ms": round((time.perf_counter() - total_t0) * 1000, 1),
+                "embedding_batch_ms": embedding_batch_ms,
+                "compression_page_ms": compression_page_ms,
+                "upsert_batch_ms": upsert_batch_ms,
+            }
         return True
 
     def get_all_documents(self) -> List[Dict[str, Any]]:
@@ -270,7 +314,8 @@ class VisionVectorStore:
         top_k: int = 3,
         prefetch_multiplier: int = 10,
         document_ids: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+        return_timing: bool = False,
+    ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Dict[str, float]]]:
         """
         用户输入问题时，通过 ColPali 获取 Text Embedding，
         利用 Qdrant 第一级 "muvera_fde" 扩大召回返回大基数侯选人（Prefetch），
@@ -286,14 +331,18 @@ class VisionVectorStore:
             List[Tuple[image_path, score]]: 匹配度排名前 k 的包含路径列表与权重的二元组。
         """
         # 第一步：计算用户查询的问题向量
+        _t0 = time.perf_counter()
         batch_queries = self.processor.process_queries([query_text]).to(self.device)
         with torch.no_grad():
             # 同样输出高维度的 128D Multi-vector
             query_embedding_tensor = self.model(**batch_queries)[0]
         
         query_colpali = query_embedding_tensor.float().cpu().numpy()
+        _t1 = time.perf_counter()  # ── ColPali query embedding done
+
         # 同样生成问题的 MUVERA 压缩版以便和图片 MUVERA 比对
         query_muvera = self.muvera.process_query(query_colpali)
+        _t2 = time.perf_counter()  # ── MUVERA query done
 
         # 同样执行防御性维度重塑 (Defensive Reshape)，防止一维铺平错误
         query_colpali_2d = query_colpali.reshape(-1, 128)
@@ -318,6 +367,7 @@ class VisionVectorStore:
             limit=top_k,
             query_filter=query_filter,
         )
+        _t3 = time.perf_counter()  # ── Qdrant query done
 
         # 对结果进行去重，避免 1 页文档重复返回多次相同证据页。
         unique = []
@@ -344,4 +394,15 @@ class VisionVectorStore:
             if len(unique) >= top_k:
                 break
 
+        _t4 = time.perf_counter()  # ── all done
+
+        if return_timing:
+            timing: Dict[str, float] = {
+                "query_embedding_ms": round((_t1 - _t0) * 1000, 1),
+                "muvera_query_ms":    round((_t2 - _t1) * 1000, 1),
+                "qdrant_query_ms":    round((_t3 - _t2) * 1000, 1),
+                "postprocess_ms":     round((_t4 - _t3) * 1000, 1),
+                "total_ms":           round((_t4 - _t0) * 1000, 1),
+            }
+            return unique, timing
         return unique
