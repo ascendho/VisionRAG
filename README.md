@@ -107,3 +107,65 @@ python -m uvicorn backend.main:app --reload --port 8000
 | `GET` | `/api/rag/files/{id}/download` | 下载原始文件 |
 | `DELETE` | `/api/rag/files/{id}` | 删除文档及其索引 |
 | `GET` | `/api/health` | 服务健康检查 |
+
+## 📊 性能 Benchmark
+
+`eval/` 目录提供三个独立的性能测试脚本，**无需 gold-page 标注**，直接测量系统延迟与吞吐。
+
+### 冷热缓存定义
+
+| track | cold | hot |
+|---|---|---|
+| 上传 | 页面图像缓存已清除（首次上传） | 页面图像缓存已预热 |
+| 问答 | 第 1 次遍历查询集（Qdrant 页表冷） | 第 2+ 次遍历查询集 |
+
+### 上传链路 benchmark
+
+```bash
+python -m eval.upload_benchmark \
+  --input qdrant_local/pdfs/your.pdf \
+  --mode both \
+  --runs 3
+```
+
+关键指标：`pdf_render_ms`、`embedding_ms`、`upsert_ms`、`total_index_ms`
+
+### 问答链路 benchmark
+
+```bash
+python -m eval.answer_benchmark \
+  --queries eval/queries/answer_queries.jsonl \
+  --runs 3
+```
+
+可选参数：`--top-k`（默认 5）、`--prefetch-multiplier`（默认 10）、`--min-score`（默认 0.6）、`--max-tokens`（默认 800）
+
+关键指标：`time_to_evidence_ms`、`time_to_first_token_ms`、`total_answer_latency_ms`、`tokens_per_second`
+
+### 架构消融实验
+
+单变量扫描，第一个值为 baseline：
+
+```bash
+# 问答 track：扫描 prefetch_multiplier
+python -m eval.architecture_ablation \
+  --track answer \
+  --knob prefetch_multiplier \
+  --values "1,5,10,20,50" \
+  --queries eval/queries/answer_queries.jsonl \
+  --runs 3
+
+# 上传 track：扫描 DPI
+python -m eval.architecture_ablation \
+  --track upload \
+  --knob dpi \
+  --values "75,150,300" \
+  --input qdrant_local/pdfs/your.pdf \
+  --runs 3
+```
+
+upload 支持的 knob：`dpi`、`embed_batch_size`、`upsert_batch_size`、`muvera_r_reps`、`muvera_dim_proj`
+
+answer 支持的 knob：`prefetch_multiplier`、`top_k`、`min_score`、`max_tokens`
+
+所有结果以 JSONL 格式保存在 `eval/results/` 目录。

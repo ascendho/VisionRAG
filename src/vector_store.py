@@ -22,19 +22,23 @@ class VisionVectorStore:
     2. 计算 MUVERA（聚类降维表示）加速在大规模文档下的第一阶段海选检索（Prefetch）。
     3. 连接并操作 Qdrant，保障两阶段检索流程。
     """
-    def __init__(self):
+    def __init__(self, muvera_r_reps: int = 30, muvera_dim_proj: int = 16):
         # 1. 链接至本地 Docker 容器启动的 Qdrant 数据库
         # check_compatibility=False 屏蔽客户端与服务端的版本次要差异警告
         self.qdrant = QdrantClient(url=QDRANT_URL, check_compatibility=False)
-        
+
+        # 记录 MUVERA 配置，供消融实验查询
+        self.muvera_r_reps = muvera_r_reps
+        self.muvera_dim_proj = muvera_dim_proj
+
         # 2. 定义 MUVERA 实例进行维度压缩与计算加速
         # 这是一种针对 Late-Interaction 模型的多维聚类方式，用于缓解在海量文档下搜索时的性能瓶颈
         self.muvera = Muvera(
-            dim=128,          # ColPali 原始维度 128
-            k_sim=6,          # 聚类数目 (2^6 = 64 clusters)
-            dim_proj=16,      # 每一簇压缩至 16 维
-            r_reps=30,        # 重复 30 次随机投影（提升 Stage 1 近似精度，CPU 侧额外开销 <3ms）
-            random_seed=42,   # 固定随机种子确保线上复现性
+            dim=128,                # ColPali 原始维度 128
+            k_sim=6,                # 聚类数目 (2^6 = 64 clusters)
+            dim_proj=muvera_dim_proj,  # 每一簇压缩至 dim_proj 维（消融可变）
+            r_reps=muvera_r_reps,   # 随机投影重复次数（消融可变）
+            random_seed=42,         # 固定随机种子确保线上复现性
         )
         
         # 3. 初始化 ColPali 视觉语言大模型
@@ -162,6 +166,7 @@ class VisionVectorStore:
         batch_size: int = 4,
         replace_document: bool = True,
         return_timing: bool = False,
+        upsert_batch_size: int = 8,
         **_ignored,
     ) -> Union[bool, Tuple[bool, Dict[str, Any]]]:
         """
@@ -252,9 +257,8 @@ class VisionVectorStore:
                 }
             return False
 
-        # 分批 upsert，每批 8 个点，避免单次请求体超过 Qdrant 默认 32MB 上限
+        # 分批 upsert，每批 upsert_batch_size 个点，避免单次请求体超过 Qdrant 默认 32MB 上限
         # 每页向量 JSON 约 1.94 MB（original 1.57 MB + muvera 0.37 MB），8 页 ≈ 15.5 MB，留足余量
-        upsert_batch_size = 8
         for i in range(0, len(points), upsert_batch_size):
             upsert_t0 = time.perf_counter()
             self.qdrant.upsert(
