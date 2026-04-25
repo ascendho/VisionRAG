@@ -107,3 +107,45 @@ python -m uvicorn backend.main:app --reload --port 8000
 | `GET` | `/api/rag/files/{id}/download` | 下载原始文件 |
 | `DELETE` | `/api/rag/files/{id}` | 删除文档及其索引 |
 | `GET` | `/api/health` | 服务健康检查 |
+
+## 📊 RAG 质量评估
+
+`eval/` 提供两个带金标（gold-page）的评估器，侧重**检索准确性**而非系统延迟。
+
+### 数据准备（必须先做）
+
+1. 把待测 PDF 通过应用上传并索引。
+2. 查看已索引文档名称（`GET /api/rag/files` 或下方命令）：
+   ```bash
+   python - <<'EOF'
+   from src.vector_store import VisionVectorStore
+   for doc in VisionVectorStore().get_all_documents():
+       print(doc['document_name'])
+   EOF
+   ```
+3. 阅读标注指南：[eval/queries/ANNOTATION_GUIDE.md](eval/queries/ANNOTATION_GUIDE.md)
+4. 参照模板 [eval/queries/gold_queries.jsonl](eval/queries/gold_queries.jsonl) 填写真实查询，每份文档 3–5 条，共 24–30 条即可跑基线。
+
+### 检索质量评估
+
+```bash
+python -m eval.retrieval_eval \
+    --queries eval/queries/gold_queries.jsonl \
+    --top-k 5 --prefetch-multiplier 10 \
+    --label baseline
+```
+
+输出指标：`Recall@1/3/5`、`MRR`、`NDCG@5`、文档路由准确率，并按 `query_type` 和 `difficulty` 分层展示。
+
+### 回答有据可依评估
+
+```bash
+python -m eval.answer_eval \
+    --queries eval/queries/gold_queries.jsonl \
+    --top-k 5 --min-score 0.5 --max-tokens 300 \
+    --label baseline
+```
+
+输出：每条查询的生成答案与参考答案并排打印，供人工逐条核对；同时报告 grounding 率（生成时使用的证据页是否与 gold page 重叠）。
+
+结果 JSONL 写入 `eval/results/`，可用于不同参数或不同模型版本之间的横向对比。
