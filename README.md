@@ -4,8 +4,6 @@
 
 基于 **ColPali + MUVERA + Qdrant** 的多格式视觉文档问答系统。上传 PDF、图片或纯文本文件，系统将每页渲染为图像后用 ColPali 建立视觉索引，查询时两阶段检索召回最相关页面，再由豆包视觉大模型生成答案，并附上原页截图供溯源。
 
-前端采用纯 Vanilla HTML/JS + Tailwind CSS 构建，风格参考 Gemini；后端基于 FastAPI 提供服务。
-
 ## 🌟 核心特性
 
 - **多格式文件支持**：PDF / PNG / JPG / JPEG / WEBP / TXT / MD，统一渲染为页面图像进入索引
