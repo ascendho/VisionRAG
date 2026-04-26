@@ -1,4 +1,4 @@
-# VisionRAG
+# VisionDoc
 
 ![image-20260425145610310](assets/image-20260425145610310.png)
 
