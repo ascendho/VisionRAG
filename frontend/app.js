@@ -723,7 +723,7 @@ function updateInputState(count) {
   if (count === 0) {
     txt.classList.remove('w-0', 'opacity-0', 'ml-0');
     txt.classList.add('w-[60px]', 'opacity-100', 'ml-1.5');
-    input.placeholder = "💡 请先点击左侧上传 PDF 文档...";
+    input.placeholder = "💡 请先点击左侧上传 PDF、图片或文本文档...";
   } else {
     txt.classList.remove('w-[60px]', 'opacity-100', 'ml-1.5');
     txt.classList.add('w-0', 'opacity-0', 'ml-0');
