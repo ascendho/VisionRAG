@@ -1,7 +1,7 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import logging
 import os
 import json
@@ -41,6 +41,8 @@ _PRE_RETRIEVAL_GUARD_PATTERNS = [
         re.compile(r"^(天气怎么样|今天天气怎么样|讲个笑话|说个笑话)$", re.IGNORECASE),
     ),
 ]
+
+_COMPOUND_QUERY_SPLIT_PATTERN = re.compile(r"[？?；;\n]+")
 
 
 def _normalize_query_text(query: str) -> str:
@@ -83,6 +85,156 @@ def _guard_obvious_out_of_scope(query: str) -> Optional[dict]:
             return _build_guarded_payload(reason=reason, stage="pre_retrieval")
 
     return None
+
+
+def _split_compound_query(query: str) -> List[str]:
+    normalized_query = re.sub(r"\s+", " ", (query or "").strip())
+    if not normalized_query:
+        return []
+
+    raw_parts = [
+        part.strip(" \t\r\n?？;；")
+        for part in _COMPOUND_QUERY_SPLIT_PATTERN.split(normalized_query)
+    ]
+
+    deduped_parts: List[str] = []
+    seen_parts = set()
+    for part in raw_parts:
+        if not part:
+            continue
+        normalized_part = _normalize_query_text(part)
+        if not normalized_part or normalized_part in seen_parts:
+            continue
+        seen_parts.add(normalized_part)
+        deduped_parts.append(part)
+
+    return deduped_parts or [normalized_query]
+
+
+def _result_identity(result: Dict[str, Any]) -> tuple:
+    return (
+        result.get("document_id", ""),
+        result.get("page_number", -1),
+        result.get("image_path", ""),
+    )
+
+
+def _filter_results_with_fallback(results: List[Dict[str, Any]], min_score: float) -> List[Dict[str, Any]]:
+    filtered = [dict(item) for item in results if float(item.get("score", 0.0)) >= min_score]
+    if not filtered and results:
+        filtered = [dict(results[0])]
+    return filtered
+
+
+def _merge_result_groups(
+    result_groups: List[List[Dict[str, Any]]],
+    sub_queries: List[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    merged_by_key: Dict[tuple, Dict[str, Any]] = {}
+    merged_order: List[Dict[str, Any]] = []
+    max_group_len = max((len(group) for group in result_groups), default=0)
+
+    for rank in range(max_group_len):
+        for part_index, group in enumerate(result_groups):
+            if rank >= len(group):
+                continue
+
+            candidate = dict(group[rank])
+            key = _result_identity(candidate)
+            if key in merged_by_key:
+                existing = merged_by_key[key]
+                existing["score"] = max(float(existing.get("score", 0.0)), float(candidate.get("score", 0.0)))
+                matched = existing.setdefault("matched_sub_queries", [])
+                sub_query = sub_queries[part_index]
+                if sub_query not in matched:
+                    matched.append(sub_query)
+                continue
+
+            candidate["matched_sub_queries"] = [sub_queries[part_index]]
+            merged_by_key[key] = candidate
+            merged_order.append(candidate)
+
+    return merged_order[:limit]
+
+
+def _aggregate_compound_retrieval_timing(
+    sub_queries: List[str],
+    timings: List[Dict[str, Any]],
+    returned_points: int,
+) -> Dict[str, Any]:
+    return {
+        "query_embedding_ms": round(sum(float(item.get("query_embedding_ms", 0.0)) for item in timings), 2),
+        "qdrant_query_ms": round(sum(float(item.get("qdrant_query_ms", 0.0)) for item in timings), 2),
+        "result_format_ms": round(sum(float(item.get("result_format_ms", 0.0)) for item in timings), 2),
+        "total_retrieval_ms": round(sum(float(item.get("total_retrieval_ms", 0.0)) for item in timings), 2),
+        "prefetch_limit": sum(int(item.get("prefetch_limit", 0)) for item in timings),
+        "returned_points": returned_points,
+        "sub_query_count": len(sub_queries),
+        "sub_query_timings": [
+            {
+                "query": sub_query,
+                "query_embedding_ms": timing.get("query_embedding_ms", 0.0),
+                "qdrant_query_ms": timing.get("qdrant_query_ms", 0.0),
+                "result_format_ms": timing.get("result_format_ms", 0.0),
+                "total_retrieval_ms": timing.get("total_retrieval_ms", 0.0),
+                "returned_points": timing.get("returned_points", 0),
+            }
+            for sub_query, timing in zip(sub_queries, timings)
+        ],
+    }
+
+
+def _retrieve_compound_aware(
+    vector_store_instance,
+    query_text: str,
+    document_ids: Optional[List[str]],
+    top_k: int,
+    min_score: float,
+) -> Dict[str, Any]:
+    sub_queries = _split_compound_query(query_text)
+    if len(sub_queries) <= 1:
+        retrieval_payload = vector_store_instance.retrieve_with_two_stage(
+            query_text=query_text,
+            document_ids=document_ids,
+            top_k=top_k,
+        )
+        results = retrieval_payload["results"]
+        return {
+            "sub_queries": sub_queries or [query_text],
+            "results": results,
+            "selected_results": _filter_results_with_fallback(results, min_score),
+            "timing": retrieval_payload["timing"],
+        }
+
+    per_sub_query_top_k = max(2, min(3, top_k))
+    selected_limit = min(8, max(top_k, len(sub_queries) * per_sub_query_top_k))
+    candidate_limit = min(12, max(selected_limit, len(sub_queries) * per_sub_query_top_k))
+
+    raw_result_groups: List[List[Dict[str, Any]]] = []
+    selected_result_groups: List[List[Dict[str, Any]]] = []
+    sub_query_timings: List[Dict[str, Any]] = []
+
+    for sub_query in sub_queries:
+        retrieval_payload = vector_store_instance.retrieve_with_two_stage(
+            query_text=sub_query,
+            document_ids=document_ids,
+            top_k=per_sub_query_top_k,
+        )
+        raw_results = retrieval_payload["results"]
+        raw_result_groups.append(raw_results)
+        selected_result_groups.append(_filter_results_with_fallback(raw_results, min_score))
+        sub_query_timings.append(retrieval_payload["timing"])
+
+    merged_results = _merge_result_groups(raw_result_groups, sub_queries, candidate_limit)
+    merged_selected_results = _merge_result_groups(selected_result_groups, sub_queries, selected_limit)
+
+    return {
+        "sub_queries": sub_queries,
+        "results": merged_results,
+        "selected_results": merged_selected_results,
+        "timing": _aggregate_compound_retrieval_timing(sub_queries, sub_query_timings, len(merged_results)),
+    }
 
 
 def _build_confidence_summary(results: List[dict]) -> dict:
@@ -351,22 +503,25 @@ async def chat(request: Request, req: ChatRequest):
     pre_guard = _guard_obvious_out_of_scope(req.query)
 
     results = []
+    score_filtered: List[Dict[str, Any]] = []
     retrieval_timing = None
+    sub_queries = [req.query]
 
     # ── 同步完成 RAG 检索（流式响应开始前必须就绪）──
     if not pre_guard:
-        retrieval_payload = vector_store_instance.retrieve_with_two_stage(
+        retrieval_payload = _retrieve_compound_aware(
+            vector_store_instance=vector_store_instance,
             query_text=req.query,
             document_ids=req.document_ids,
-            top_k=req.top_k
+            top_k=req.top_k,
+            min_score=req.min_score,
         )
         results = retrieval_payload["results"]
+        score_filtered = retrieval_payload["selected_results"]
         retrieval_timing = retrieval_payload["timing"]
+        sub_queries = retrieval_payload["sub_queries"]
 
     _rebuild_image_cache_if_needed(results)
-    score_filtered = [r for r in results if float(r.get("score", 0)) >= req.min_score]
-    if not score_filtered and results:
-        score_filtered = results[:1]
     valid_results = [r for r in score_filtered if os.path.exists(str(r.get("image_path", "")))]
     evidence_images = [r["image_path"] for r in valid_results if r.get("image_path")]
     confidence = _build_confidence_summary(valid_results)
@@ -387,6 +542,7 @@ async def chat(request: Request, req: ChatRequest):
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
+            "matched_sub_queries": list(r.get("matched_sub_queries", [])),
         })
         frontend_evidences.append({
             "evidence_id": evidence_id,
@@ -428,12 +584,16 @@ async def chat(request: Request, req: ChatRequest):
         )
     else:
         logger.info(
-            "chat_retrieval timing=%s confidence=%s document_scope=%s",
+            "chat_retrieval timing=%s confidence=%s document_scope=%s sub_queries=%s",
             retrieval_timing,
             confidence,
             req.document_ids,
+            sub_queries,
         )
-        print(f"[Chat] confidence={confidence} timing={retrieval_timing} document_scope={req.document_ids}")
+        print(
+            f"[Chat] confidence={confidence} timing={retrieval_timing} "
+            f"document_scope={req.document_ids} sub_queries={sub_queries}"
+        )
 
     async def event_stream():
         if pre_guard:
@@ -459,6 +619,7 @@ async def chat(request: Request, req: ChatRequest):
             image_paths=evidence_images,
             chat_history=req.chat_history,
             evidence_context=evidence_context,
+            sub_queries=sub_queries,
         )
         generation_start = time.perf_counter()
         first_token_ms = None

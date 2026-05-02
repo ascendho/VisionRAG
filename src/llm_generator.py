@@ -49,7 +49,9 @@ def _build_system_prompt() -> str:
         "5. 如果用户问题超出当前证据范围，要直接说明超出范围，不要借助常识扩写。\n"
         "6. 如果历史对话与当前证据冲突，以当前证据为准，并指出冲突点。\n"
         "7. 不要声称看过未提供的页面，也不要编造证据编号、页码、文档名或引用。\n"
-        "8. 输出尽量使用以下结构中的适用部分：`结论`、`依据`、`不确定点`。"
+        "8. 输出尽量使用以下结构中的适用部分：`结论`、`依据`、`不确定点`。\n"
+        "9. 如果用户问题包含多个独立子问题，必须逐项回答每一项，不要只回答其中一部分。\n"
+        "10. 对证据不足的子问题，要单独写明“根据当前证据无法确认”，不要让一个子问题的证据结论替代另一个子问题。"
     )
 
 
@@ -63,26 +65,39 @@ def _format_evidence_context(evidence_context: List[dict] | None = None) -> str:
         document_name = item.get("document_name", "未知文档")
         page_number = item.get("page_number", "?")
         score = item.get("score")
+        matched_sub_queries = item.get("matched_sub_queries") or []
         if isinstance(score, (float, int)):
-            lines.append(f"[{evidence_id}] 文档：{document_name}；页码：{page_number}；相关性分数：{score:.2f}")
+            line = f"[{evidence_id}] 文档：{document_name}；页码：{page_number}；相关性分数：{score:.2f}"
         else:
-            lines.append(f"[{evidence_id}] 文档：{document_name}；页码：{page_number}")
+            line = f"[{evidence_id}] 文档：{document_name}；页码：{page_number}"
+
+        if matched_sub_queries:
+            line += f"；更可能对应：{' / '.join(matched_sub_queries)}"
+
+        lines.append(line)
     return "\n".join(lines)
 
 
 def _build_turn_sections(
     query_text: str,
     evidence_context: List[dict] | None = None,
+    sub_queries: List[str] | None = None,
 ) -> List[str]:
     sections = [
         "请只根据当前提供的文档截图和证据元数据回答下面的问题。",
         "如果证据不足、图片不可读或信息冲突，请直接说明，不要猜测。",
         "如果需要引用依据，只能使用给定的证据编号，格式必须是 [E1]、[E2]。",
     ]
+    if sub_queries and len(sub_queries) > 1:
+        sections.append("本轮识别到多个独立子问题，请逐项回答，不能遗漏任何一项。")
+        sections.append("请按“子问题 1 / 子问题 2 / ...”的结构组织答案，并对每个子问题单独判断证据是否充分。")
+        sections.append("识别到的子问题如下：")
+        sections.extend([f"子问题 {index}: {sub_query}" for index, sub_query in enumerate(sub_queries, start=1)])
+
     evidence_text = _format_evidence_context(evidence_context)
     if evidence_text:
         sections.append(evidence_text)
-    sections.append(f"用户问题：{query_text}")
+    sections.append(f"用户原始问题：{query_text}" if sub_queries and len(sub_queries) > 1 else f"用户问题：{query_text}")
     return sections
 
 
@@ -90,8 +105,9 @@ def _build_current_turn_content(
     query_text: str,
     image_paths: List[str],
     evidence_context: List[dict] | None = None,
+    sub_queries: List[str] | None = None,
 ) -> List[dict]:
-    turn_sections = _build_turn_sections(query_text, evidence_context)
+    turn_sections = _build_turn_sections(query_text, evidence_context, sub_queries)
 
     content_list: List[dict] = [{"type": "text", "text": "\n\n".join(turn_sections)}]
     content_list.extend(_build_image_content_list(image_paths))
@@ -165,6 +181,7 @@ def generate_answer_with_vision(
     query_text: str,
     image_paths: List[str],
     evidence_context: List[dict] | None = None,
+    sub_queries: List[str] | None = None,
     max_tokens: int = 600,
 ) -> str:
     """
@@ -179,7 +196,7 @@ def generate_answer_with_vision(
 
     client = _build_client()
     system_prompt = _build_system_prompt()
-    content_list = _build_current_turn_content(query_text, image_paths, evidence_context)
+    content_list = _build_current_turn_content(query_text, image_paths, evidence_context, sub_queries)
 
     try:
         response = client.chat.completions.create(
@@ -214,6 +231,7 @@ def generate_answer_stream(
     image_paths: List[str],
     chat_history: List[dict] | None = None,
     evidence_context: List[dict] | None = None,
+    sub_queries: List[str] | None = None,
     max_tokens: int = 800,
 ) -> Generator[str, None, None]:
     """
@@ -236,7 +254,7 @@ def generate_answer_stream(
     }
 
     # 当前轮：图像 + 问题
-    current_content = _build_current_turn_content(query_text, image_paths, evidence_context)
+    current_content = _build_current_turn_content(query_text, image_paths, evidence_context, sub_queries)
 
     # 构建消息列表：系统 → 历史（最近 10 轮 = 20 条）→ 当前
     history = (chat_history or [])[-20:]
