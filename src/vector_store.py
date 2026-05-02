@@ -1,4 +1,6 @@
 import hashlib
+import logging
+import time
 from typing import Any, Dict, List, Optional
 import warnings
 
@@ -12,6 +14,8 @@ from colpali_engine.models import ColPali, ColPaliProcessor
 from PIL import Image
 
 from src.config import QDRANT_URL, COLLECTION_NAME, COLPALI_MODEL_NAME
+
+logger = logging.getLogger(__name__)
 
 class VisionVectorStore:
     """
@@ -161,7 +165,7 @@ class VisionVectorStore:
         batch_size: int = 4,
         replace_document: bool = True,
         **_ignored,
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """
         将转换好的 PDF 每页图片利用 ColPali 模型送入并转为稠密向量，通过 MUVERA 进行压缩扩展，然后写到 Qdrant 中。
         采用分批处理（Batched Processing），防止由于页数太多导致本地显存或系统内存爆炸。
@@ -172,6 +176,9 @@ class VisionVectorStore:
         """
         document_id = document_id or hashlib.sha1("\n".join(image_paths).encode("utf-8")).hexdigest()
         document_name = document_name or document_id
+        total_index_start = time.perf_counter()
+        embedding_ms = 0.0
+        point_build_ms = 0.0
 
         if replace_document:
             self.delete_document(document_id)
@@ -184,16 +191,19 @@ class VisionVectorStore:
             images = [Image.open(p).convert("RGB") for p in batch_paths]
 
             try:
+                embedding_start = time.perf_counter()
                 # 将图片信息预处理为 ColPali 模型可接收的格式 (类似 Vit 结合 LLaMA 预处理)
                 batch_inputs = self.processor.process_images(images).to(self.device).to(self.model.dtype)
 
                 with torch.no_grad():
                     # 获取高质量多向量输出
                     image_embeddings = self.model(**batch_inputs)
+                embedding_ms += (time.perf_counter() - embedding_start) * 1000
             finally:
                 for img in images:
                     img.close()
-                
+
+            point_build_start = time.perf_counter()
             # 转换为 Numpy，接着使用 MUVERA 根据原本的多模态特征派生压缩版的加速特征
             cpu_embeddings = [emb.float().cpu().numpy() for emb in image_embeddings]
             
@@ -220,19 +230,51 @@ class VisionVectorStore:
                     }
                 )
                 points.append(point)
+            point_build_ms += (time.perf_counter() - point_build_start) * 1000
                 
         if not points:
-            return False
+            return {
+                "ok": False,
+                "timing": {
+                    "pages": total_images,
+                    "embedding_ms": round(embedding_ms, 2),
+                    "point_build_ms": round(point_build_ms, 2),
+                    "qdrant_upsert_ms": 0.0,
+                    "total_index_ms": round((time.perf_counter() - total_index_start) * 1000, 2),
+                    "device": self.device,
+                    "batch_size": batch_size,
+                },
+            }
 
         # 分批 upsert，每批 8 个点，避免单次请求体超过 Qdrant 默认 32MB 上限
         # 每页向量 JSON 约 1.94 MB（original 1.57 MB + muvera 0.37 MB），8 页 ≈ 15.5 MB，留足余量
         upsert_batch_size = 8
+        upsert_start = time.perf_counter()
         for i in range(0, len(points), upsert_batch_size):
             self.qdrant.upsert(
                 collection_name=COLLECTION_NAME,
                 points=points[i:i + upsert_batch_size]
             )
-        return True
+        qdrant_upsert_ms = (time.perf_counter() - upsert_start) * 1000
+        total_index_ms = (time.perf_counter() - total_index_start) * 1000
+        timing = {
+            "pages": total_images,
+            "embedding_ms": round(embedding_ms, 2),
+            "point_build_ms": round(point_build_ms, 2),
+            "qdrant_upsert_ms": round(qdrant_upsert_ms, 2),
+            "total_index_ms": round(total_index_ms, 2),
+            "device": self.device,
+            "batch_size": batch_size,
+            "upsert_batch_size": upsert_batch_size,
+        }
+        logger.info("index_timing document_id=%s timing=%s", document_id, timing)
+        print(
+            "[Index] "
+            f"document_id={document_id} pages={total_images} device={self.device} "
+            f"embed={timing['embedding_ms']}ms build={timing['point_build_ms']}ms "
+            f"upsert={timing['qdrant_upsert_ms']}ms total={timing['total_index_ms']}ms"
+        )
+        return {"ok": True, "timing": timing}
 
     def get_all_documents(self) -> List[Dict[str, Any]]:
         """
@@ -264,13 +306,55 @@ class VisionVectorStore:
             print(f"Error fetching documents: {e}")
             return []
 
+    def get_document_page_samples(self, document_id: str, limit: int = 4) -> List[Dict[str, Any]]:
+        """返回指定文档的代表页，用于建议问题等轻量功能。"""
+        if not document_id:
+            return []
+
+        try:
+            records, _ = self.qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="document_id",
+                            match=models.MatchValue(value=document_id),
+                        )
+                    ]
+                ),
+                with_payload=["image_path", "document_id", "document_name", "page_number"],
+                with_vectors=False,
+                limit=max(limit * 4, 50),
+            )
+        except Exception as exc:
+            logger.warning("failed_to_load_document_page_samples document_id=%s error=%s", document_id, exc)
+            return []
+
+        pages = []
+        for record in records:
+            payload = record.payload or {}
+            image_path = payload.get("image_path", "")
+            if not image_path:
+                continue
+            pages.append(
+                {
+                    "image_path": image_path,
+                    "document_id": payload.get("document_id", ""),
+                    "document_name": payload.get("document_name", "Unknown File"),
+                    "page_number": payload.get("page_number", 0),
+                }
+            )
+
+        pages.sort(key=lambda item: item.get("page_number", 0))
+        return pages[:limit]
+
     def retrieve_with_two_stage(
         self,
         query_text: str,
         top_k: int = 3,
         prefetch_multiplier: int = 10,
         document_ids: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         用户输入问题时，通过 ColPali 获取 Text Embedding，
         利用 Qdrant 第一级 "muvera_fde" 扩大召回返回大基数侯选人（Prefetch），
@@ -285,7 +369,10 @@ class VisionVectorStore:
         返回:
             List[Tuple[image_path, score]]: 匹配度排名前 k 的包含路径列表与权重的二元组。
         """
+        total_start = time.perf_counter()
+
         # 第一步：计算用户查询的问题向量
+        query_embedding_start = time.perf_counter()
         batch_queries = self.processor.process_queries([query_text]).to(self.device)
         with torch.no_grad():
             # 同样输出高维度的 128D Multi-vector
@@ -298,12 +385,14 @@ class VisionVectorStore:
         # 同样执行防御性维度重塑 (Defensive Reshape)，防止一维铺平错误
         query_colpali_2d = query_colpali.reshape(-1, 128)
         query_muvera_2d = query_muvera.reshape(-1, 16)
+        query_embedding_ms = (time.perf_counter() - query_embedding_start) * 1000
         # 归一化因子：查询 token 数量，使分数落入 [0, 1] 区间，消除查询长度对阈值的影响
         n_query_tokens = max(query_colpali_2d.shape[0], 1)
 
         query_filter = self._build_document_filter(document_ids)
 
         # 第二步：单次 API 请求完成"海选"加"优选"
+        qdrant_query_start = time.perf_counter()
         results = self.qdrant.query_points(
             collection_name=COLLECTION_NAME,
             prefetch=[
@@ -318,8 +407,10 @@ class VisionVectorStore:
             limit=top_k,
             query_filter=query_filter,
         )
+        qdrant_query_ms = (time.perf_counter() - qdrant_query_start) * 1000
 
         # 对结果进行去重，避免 1 页文档重复返回多次相同证据页。
+        result_format_start = time.perf_counter()
         unique = []
         seen = set()
         for point in results.points:
@@ -344,4 +435,32 @@ class VisionVectorStore:
             if len(unique) >= top_k:
                 break
 
-        return unique
+        result_format_ms = (time.perf_counter() - result_format_start) * 1000
+        total_retrieval_ms = (time.perf_counter() - total_start) * 1000
+        retrieval_timing = {
+            "query_embedding_ms": round(query_embedding_ms, 2),
+            "qdrant_query_ms": round(qdrant_query_ms, 2),
+            "result_format_ms": round(result_format_ms, 2),
+            "total_retrieval_ms": round(total_retrieval_ms, 2),
+            "prefetch_limit": top_k * prefetch_multiplier,
+            "returned_points": len(unique),
+        }
+        logger.info(
+            "retrieval_timing total_retrieval_ms=%.2f qdrant_query_ms=%.2f query_embedding_ms=%.2f result_format_ms=%.2f top_k=%s prefetch_limit=%s",
+            retrieval_timing["total_retrieval_ms"],
+            retrieval_timing["qdrant_query_ms"],
+            retrieval_timing["query_embedding_ms"],
+            retrieval_timing["result_format_ms"],
+            top_k,
+            retrieval_timing["prefetch_limit"],
+        )
+        print(
+            "[Retrieval] "
+            f"total={retrieval_timing['total_retrieval_ms']}ms "
+            f"embed={retrieval_timing['query_embedding_ms']}ms "
+            f"qdrant={retrieval_timing['qdrant_query_ms']}ms "
+            f"format={retrieval_timing['result_format_ms']}ms "
+            f"top_k={top_k} prefetch_limit={retrieval_timing['prefetch_limit']}"
+        )
+
+        return {"results": unique, "timing": retrieval_timing}

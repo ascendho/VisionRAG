@@ -1,17 +1,22 @@
-from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
+from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
+import logging
 import os
 import json
+import re
 import shutil
 import tempfile
 import glob
+import time
 
 from src.doc_processor import process_pdf_to_images, process_image_to_images, process_text_to_images, get_file_hash
-from src.llm_generator import generate_answer_stream
+from src.llm_generator import generate_answer_stream, generate_suggested_questions
+from src.config import DEFAULT_MIN_SCORE, QUERY_GUARD_ENABLED
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # DTO schema for chat request
 class ChatRequest(BaseModel):
@@ -19,7 +24,89 @@ class ChatRequest(BaseModel):
     document_ids: Optional[List[str]] = None
     chat_history: Optional[List[dict]] = None
     top_k: int = 5
-    min_score: float = 0.6
+    min_score: float = DEFAULT_MIN_SCORE
+
+
+_PRE_RETRIEVAL_GUARD_PATTERNS = [
+    (
+        "assistant_identity",
+        re.compile(r"^(你是谁|你是誰|你叫什么|你叫啥|你叫什麼|介绍你自己|介绍一下你自己|请介绍一下你自己|你能做什么|你会什么)$", re.IGNORECASE),
+    ),
+    (
+        "small_talk",
+        re.compile(r"^(你好|您好|hello|hi|hey)$", re.IGNORECASE),
+    ),
+    (
+        "off_topic_smalltalk",
+        re.compile(r"^(天气怎么样|今天天气怎么样|讲个笑话|说个笑话)$", re.IGNORECASE),
+    ),
+]
+
+
+def _normalize_query_text(query: str) -> str:
+    return re.sub(r"[\s\.,!?，。！？、:：;；\"'“”‘’()（）【】\[\]<>《》]+", "", query.lower()).strip()
+
+
+def _build_guarded_payload(reason: str, stage: str, message: Optional[str] = None, meta: Optional[dict] = None) -> dict:
+    if message is None:
+        if reason == "assistant_identity":
+            message = (
+                "这个问题不属于当前文档问答范围。"
+                "我只能依据已上传文档中的证据回答问题，暂时不能回答关于助手身份或能力设定的问题。"
+                "请改问与文档内容直接相关的问题。"
+            )
+        else:
+            message = (
+                "这个问题与当前文档内容范围无关，或缺少足够可靠的文档证据。"
+                "我暂时不返回依据页，也不会基于外部常识作答。"
+                "请换一个更贴近文档内容的问题。"
+            )
+
+    return {
+        "message": message,
+        "reason": reason,
+        "stage": stage,
+        "meta": meta or {},
+    }
+
+
+def _guard_obvious_out_of_scope(query: str) -> Optional[dict]:
+    if not QUERY_GUARD_ENABLED:
+        return None
+
+    normalized = _normalize_query_text(query)
+    if not normalized:
+        return None
+
+    for reason, pattern in _PRE_RETRIEVAL_GUARD_PATTERNS:
+        if pattern.match(normalized):
+            return _build_guarded_payload(reason=reason, stage="pre_retrieval")
+
+    return None
+
+
+def _build_confidence_summary(results: List[dict]) -> dict:
+    scores = sorted((float(item.get("score", 0.0)) for item in results), reverse=True)[:3]
+    if not scores:
+        return {"label": "低", "score": 0.0, "sample_size": 0, "tier": "low"}
+
+    avg_score = sum(scores) / len(scores)
+    if avg_score >= 0.85:
+        label = "高"
+        tier = "high"
+    elif avg_score >= 0.7:
+        label = "中"
+        tier = "medium"
+    else:
+        label = "低"
+        tier = "low"
+
+    return {
+        "label": label,
+        "score": round(avg_score, 2),
+        "sample_size": len(scores),
+        "tier": tier,
+    }
 
 
 def _rebuild_image_cache_if_needed(results: list) -> None:
@@ -139,12 +226,14 @@ def upload_file(file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, buffer)
             
         # 1. 解析文件到图像缓存
+        image_render_start = time.perf_counter()
         if suffix == ".pdf":
             image_paths = process_pdf_to_images(temp_path)
         elif suffix in {".txt", ".md"}:
             image_paths = process_text_to_images(temp_path)
         else:
             image_paths = process_image_to_images(temp_path)
+        document_render_ms = (time.perf_counter() - image_render_start) * 1000
         
         if not image_paths:
             raise HTTPException(status_code=500, detail="未能成功解析出任何页面图像")
@@ -166,20 +255,33 @@ def upload_file(file: UploadFile = File(...)):
             raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
 
         # 2. 将图片转换为 ColPali 向量并建立索引
-        success = vector_store_instance.embed_and_store_documents(
+        index_result = vector_store_instance.embed_and_store_documents(
             image_paths=image_paths,
             document_id=file_hash,
             document_name=file.filename
         )
-        
-        if not success:
+
+        if not index_result.get("ok"):
             raise HTTPException(status_code=500, detail="存储多模态特征库发生意外错误")
+
+        upload_timing = {
+            "document_render_ms": round(document_render_ms, 2),
+            **index_result.get("timing", {}),
+        }
+        logger.info("upload_timing file=%s timing=%s", file.filename, upload_timing)
+        print(
+            "[Upload] "
+            f"file={file.filename} render={upload_timing['document_render_ms']}ms "
+            f"embed={upload_timing.get('embedding_ms', 0)}ms build={upload_timing.get('point_build_ms', 0)}ms "
+            f"upsert={upload_timing.get('qdrant_upsert_ms', 0)}ms total_index={upload_timing.get('total_index_ms', 0)}ms"
+        )
 
         return {
             "status": "success",
             "document_id": file_hash,
             "document_name": file.filename,
-            "page_count": len(image_paths)
+            "page_count": len(image_paths),
+            "timing": upload_timing,
         }
     except HTTPException:
         raise
@@ -190,8 +292,54 @@ def upload_file(file: UploadFile = File(...)):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+
+@router.get("/files/{document_id}/suggestions")
+def get_document_suggestions(document_id: str, max_questions: int = 4):
+    from backend.main import vector_store_instance
+
+    if vector_store_instance is None:
+        raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
+
+    sample_pages = vector_store_instance.get_document_page_samples(
+        document_id=document_id,
+        limit=max(3, min(max_questions, 5)),
+    )
+    if not sample_pages:
+        raise HTTPException(status_code=404, detail="未找到可用于生成建议问题的文档页面")
+
+    _rebuild_image_cache_if_needed(sample_pages)
+    available_pages = [page for page in sample_pages if os.path.exists(str(page.get("image_path", "")))]
+    if not available_pages:
+        raise HTTPException(status_code=404, detail="建议问题所需的页面缓存不可用")
+
+    evidence_context = []
+    image_paths = []
+    for index, page in enumerate(available_pages, start=1):
+        image_paths.append(page["image_path"])
+        evidence_context.append(
+            {
+                "evidence_id": f"E{index}",
+                "document_name": page.get("document_name", "Unknown File"),
+                "page_number": page.get("page_number", 0),
+            }
+        )
+
+    questions = generate_suggested_questions(
+        document_name=available_pages[0].get("document_name", document_id),
+        image_paths=image_paths,
+        evidence_context=evidence_context,
+        max_questions=max_questions,
+    )
+
+    return {
+        "status": "success",
+        "document_id": document_id,
+        "document_name": available_pages[0].get("document_name", document_id),
+        "questions": questions,
+    }
+
 @router.post("/chat")
-def chat(req: ChatRequest):
+async def chat(request: Request, req: ChatRequest):
     """
     接收对某几篇（或全部）文档的查询，通过 SSE 流式返回：
     第一个事件为 evidence 卡片数据，后续事件为逐 token 文字，最终发送 [DONE]。
@@ -200,12 +348,20 @@ def chat(req: ChatRequest):
     if vector_store_instance is None:
         raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
 
+    pre_guard = _guard_obvious_out_of_scope(req.query)
+
+    results = []
+    retrieval_timing = None
+
     # ── 同步完成 RAG 检索（流式响应开始前必须就绪）──
-    results = vector_store_instance.retrieve_with_two_stage(
-        query_text=req.query,
-        document_ids=req.document_ids,
-        top_k=req.top_k
-    )
+    if not pre_guard:
+        retrieval_payload = vector_store_instance.retrieve_with_two_stage(
+            query_text=req.query,
+            document_ids=req.document_ids,
+            top_k=req.top_k
+        )
+        results = retrieval_payload["results"]
+        retrieval_timing = retrieval_payload["timing"]
 
     _rebuild_image_cache_if_needed(results)
     score_filtered = [r for r in results if float(r.get("score", 0)) >= req.min_score]
@@ -213,14 +369,27 @@ def chat(req: ChatRequest):
         score_filtered = results[:1]
     valid_results = [r for r in score_filtered if os.path.exists(str(r.get("image_path", "")))]
     evidence_images = [r["image_path"] for r in valid_results if r.get("image_path")]
+    confidence = _build_confidence_summary(valid_results)
 
     used_keys = {(r.get("document_id", ""), r.get("page_number", -1)) for r in valid_results}
+    evidence_id_map = {}
     frontend_evidences = []
-    for r in valid_results:
+    evidence_context = []
+    for index, r in enumerate(valid_results, start=1):
         image_path = str(r.get("image_path", ""))
         if not image_path:
             continue
+        key = (r.get("document_id", ""), r.get("page_number", -1))
+        evidence_id = f"E{index}"
+        evidence_id_map[key] = evidence_id
+        evidence_context.append({
+            "evidence_id": evidence_id,
+            "document_name": r.get("document_name", "Unknown File"),
+            "page_number": r.get("page_number", 0),
+            "score": float(r.get("score", 0.0)),
+        })
         frontend_evidences.append({
+            "evidence_id": evidence_id,
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
@@ -235,6 +404,7 @@ def chat(req: ChatRequest):
             continue
         key = (r.get("document_id", ""), r.get("page_number", -1))
         all_candidates_fe.append({
+            "evidence_id": evidence_id_map.get(key),
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
@@ -242,24 +412,84 @@ def chat(req: ChatRequest):
             "is_used": key in used_keys,
         })
 
-    def event_stream():
+    if pre_guard:
+        guard_payload = pre_guard
+        logger.info(
+            "chat_guarded stage=%s reason=%s query=%r document_scope=%s meta=%s",
+            guard_payload["stage"],
+            guard_payload["reason"],
+            req.query,
+            req.document_ids,
+            guard_payload.get("meta", {}),
+        )
+        print(
+            f"[Chat Guard] stage={guard_payload['stage']} reason={guard_payload['reason']} "
+            f"document_scope={req.document_ids} meta={guard_payload.get('meta', {})}"
+        )
+    else:
+        logger.info(
+            "chat_retrieval timing=%s confidence=%s document_scope=%s",
+            retrieval_timing,
+            confidence,
+            req.document_ids,
+        )
+        print(f"[Chat] confidence={confidence} timing={retrieval_timing} document_scope={req.document_ids}")
+
+    async def event_stream():
+        if pre_guard:
+            guard_payload = pre_guard
+            yield f"data: {json.dumps({'type': 'guarded', 'data': guard_payload})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
         # ── 事件 1: 证据卡片 ──
+        if await request.is_disconnected():
+            return
+
         if not evidence_images:
             yield f"data: {json.dumps({'type': 'error', 'data': '抱歉，未能检索出与该问题高度匹配的页面。'})}\n\n"
             yield "data: [DONE]\n\n"
             return
 
-        yield f"data: {json.dumps({'type': 'evidences', 'data': {'evidences': frontend_evidences, 'all_candidates': all_candidates_fe}})}\n\n"
+        yield f"data: {json.dumps({'type': 'evidences', 'data': {'evidences': frontend_evidences, 'all_candidates': all_candidates_fe, 'confidence': confidence, 'retrieval_timing': retrieval_timing}})}\n\n"
 
         # ── 事件 2..N: 逐 token 文字 ──
-        for token in generate_answer_stream(
+        token_stream = generate_answer_stream(
             query_text=req.query,
             image_paths=evidence_images,
             chat_history=req.chat_history,
-        ):
-            yield f"data: {json.dumps({'type': 'token', 'data': token})}\n\n"
+            evidence_context=evidence_context,
+        )
+        generation_start = time.perf_counter()
+        first_token_ms = None
+        token_count = 0
+        try:
+            for token in token_stream:
+                if first_token_ms is None:
+                    first_token_ms = (time.perf_counter() - generation_start) * 1000
+                token_count += 1
+                if await request.is_disconnected():
+                    return
+                yield f"data: {json.dumps({'type': 'token', 'data': token})}\n\n"
+        finally:
+            total_generation_ms = (time.perf_counter() - generation_start) * 1000
+            generation_timing = {
+                "first_token_ms": round(first_token_ms or 0.0, 2),
+                "total_generation_ms": round(total_generation_ms, 2),
+                "token_count": token_count,
+            }
+            logger.info("chat_generation timing=%s document_scope=%s", generation_timing, req.document_ids)
+            print(
+                "[Generation] "
+                f"first_token={generation_timing['first_token_ms']}ms "
+                f"total={generation_timing['total_generation_ms']}ms tokens={token_count} "
+                f"document_scope={req.document_ids}"
+            )
+            token_stream.close()
 
         # ── 结束哨兵 ──
+        if await request.is_disconnected():
+            return
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

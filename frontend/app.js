@@ -4,6 +4,24 @@ let isUploading = false;
 let isChatting = false;
 let selectedDocIds = null; // null = 全部文档；array of IDs = 当前选中的范围
 let conversationHistory = []; // Multi-turn memory
+const STREAM_SCROLL_THRESHOLD = 96;
+const assistantMessageCache = new Map();
+const messageMetaCache = new Map();
+const retryableRequests = new Map();
+const activeChat = {
+  controller: null,
+  msgId: null,
+  answerText: '',
+  renderFrame: null,
+  autoScroll: true,
+  requestSnapshot: null,
+  loadId: null,
+  wasStopped: false,
+  stopRequested: false,
+};
+const SEND_BUTTON_HTML = `<svg class="w-5 h-5 mx-auto" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>`;
+const STOP_BUTTON_HTML = `<svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"></rect></svg><span class="text-[13px] font-semibold leading-none">停止</span>`;
+const STOPPING_BUTTON_HTML = `<div class="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin"></div><span class="text-[13px] font-semibold leading-none">停止中</span>`;
 
 // Elements
 const bottomFileInput = document.getElementById('bottomFileInput');
@@ -16,6 +34,548 @@ const chatHistory = document.getElementById('chatHistory');
 const messagesContainer = document.getElementById('messagesContainer');
 const appBody = document.getElementById('appBody');
 const appMain = document.getElementById('appMain');
+
+function cloneMessages(messages = []) {
+  return messages.map((message) => ({ ...message }));
+}
+
+function getSelectedDocIdsSnapshot() {
+  return Array.isArray(selectedDocIds) ? [...selectedDocIds] : null;
+}
+
+function cloneRequestSnapshot(snapshot) {
+  return {
+    query: snapshot.query,
+    top_k: snapshot.top_k,
+    selectedDocIds: Array.isArray(snapshot.selectedDocIds) ? [...snapshot.selectedDocIds] : null,
+    chatHistory: cloneMessages(snapshot.chatHistory || []),
+    targetMsgId: snapshot.targetMsgId || null,
+  };
+}
+
+function buildRequestSnapshot(queryText, requestSnapshot = null) {
+  if (requestSnapshot) return cloneRequestSnapshot(requestSnapshot);
+  return {
+    query: queryText,
+    top_k: 5,
+    selectedDocIds: getSelectedDocIdsSnapshot(),
+    chatHistory: cloneMessages(conversationHistory),
+    targetMsgId: null,
+  };
+}
+
+function getMessageMeta(msgId) {
+  return messageMetaCache.get(msgId) || { evidences: [], allCandidates: [], confidence: null, retrievalTiming: null };
+}
+
+function setMessageMeta(msgId, meta = {}) {
+  messageMetaCache.set(msgId, {
+    evidences: Array.isArray(meta.evidences) ? meta.evidences : [],
+    allCandidates: Array.isArray(meta.allCandidates) ? meta.allCandidates : [],
+    confidence: meta.confidence || null,
+    retrievalTiming: meta.retrievalTiming || null,
+  });
+}
+
+function buildConfidenceBadgeMarkup(confidence) {
+  if (!confidence || !confidence.sample_size) return '';
+
+  return `<span class="message-meta-badge message-meta-badge--neutral" title="已采用证据页 top-${confidence.sample_size} 的归一化 MaxSim 平均分">证据质量 ${Number(confidence.score || 0).toFixed(2)}</span>`;
+}
+
+function buildRetrievalTimingMarkup(retrievalTiming) {
+  if (!retrievalTiming || typeof retrievalTiming.total_retrieval_ms !== 'number') return '';
+  return `<span class="message-meta-badge message-meta-badge--neutral" title="Query Embedding ${retrievalTiming.query_embedding_ms} ms · Qdrant ${retrievalTiming.qdrant_query_ms} ms">检索 ${Math.round(retrievalTiming.total_retrieval_ms)} ms</span>`;
+}
+
+function buildMessageMetaMarkup(msgId, meta = {}) {
+  const badges = [
+    buildConfidenceBadgeMarkup(meta.confidence),
+    buildRetrievalTimingMarkup(meta.retrievalTiming),
+  ].filter(Boolean);
+
+  if (!badges.length) return '';
+  return `<div id="stream-meta-${msgId}" class="flex flex-wrap items-center gap-2 mb-3">${badges.join('')}</div>`;
+}
+
+function toggleEvidenceSection(msgId, forceExpanded = null) {
+  const panel = document.getElementById(`evidence-body-${msgId}`);
+  const button = document.getElementById(`evidence-toggle-${msgId}`);
+  if (!panel || !button) return false;
+
+  const shouldExpand = forceExpanded === null
+    ? panel.style.display === 'none'
+    : forceExpanded;
+  const count = Number(button.dataset.count || 0);
+  const label = button.querySelector('[data-evidence-label]');
+  const meta = button.querySelector('[data-evidence-meta]');
+  const icon = button.querySelector('svg');
+
+  panel.style.display = shouldExpand ? 'block' : 'none';
+  button.setAttribute('aria-expanded', shouldExpand ? 'true' : 'false');
+  if (label) label.textContent = shouldExpand ? '收起依据' : '查看依据';
+  if (meta) meta.textContent = shouldExpand ? '已展开引用来源' : `默认收起 · 共 ${count} 条依据`;
+  if (icon) icon.style.transform = shouldExpand ? 'rotate(180deg)' : 'rotate(0deg)';
+  return shouldExpand;
+}
+
+function ensureEvidenceSectionVisible(msgId) {
+  toggleEvidenceSection(msgId, true);
+}
+
+function decorateCitationHtml(msgId, html) {
+  const evidenceIds = new Set(
+    getMessageMeta(msgId).evidences
+      .map((evidence) => evidence.evidence_id)
+      .filter(Boolean)
+  );
+
+  return html.replace(/\[(E\d+)\]/g, (match, evidenceId) => {
+    if (!evidenceIds.has(evidenceId)) {
+      return `<span class="citation-token citation-token--missing" title="未找到 ${evidenceId} 对应的证据卡片">${match}</span>`;
+    }
+
+    return `<button type="button" class="citation-token" onclick="focusEvidenceCard('${msgId}', '${evidenceId}')" title="定位到 ${evidenceId} 对应的证据卡片">${match}</button>`;
+  });
+}
+
+function renderMarkdownWithCitations(msgId, markdownText) {
+  return decorateCitationHtml(msgId, marked.parse(markdownText));
+}
+
+function focusEvidenceCard(msgId, evidenceId) {
+  ensureEvidenceSectionVisible(msgId);
+  const card = document.getElementById(`evidence-${msgId}-${evidenceId}`);
+  if (!card) return;
+
+  requestAnimationFrame(() => {
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+    card.classList.remove('evidence-card-highlight');
+    void card.offsetWidth;
+    card.classList.add('evidence-card-highlight');
+    setTimeout(() => card.classList.remove('evidence-card-highlight'), 1600);
+  });
+}
+
+function applySuggestedQuestion(question) {
+  if (!queryInput || !question) return;
+  queryInput.value = question;
+  queryInput.focus();
+  if (isChatting) return;
+  handleChat({ queryText: question });
+}
+
+function buildSuggestionChipMarkup(question) {
+  const escapedQuestion = escapeHtml(question);
+  return `<button class="suggestion-chip" onclick="applySuggestedQuestion(this.dataset.question)" data-question="${escapedQuestion}">${escapedQuestion}</button>`;
+}
+
+function buildSuggestedQuestionBody(state, questions = []) {
+  if (state === 'loading') {
+    return `
+      <div class="suggestion-skeleton" aria-hidden="true">
+        <div class="suggestion-skeleton-bar suggestion-skeleton-bar--long"></div>
+        <div class="suggestion-skeleton-bar suggestion-skeleton-bar--mid"></div>
+        <div class="suggestion-skeleton-bar suggestion-skeleton-bar--short"></div>
+      </div>`;
+  }
+
+  if (state === 'error' || questions.length === 0) {
+    return `<p class="document-ready-note">常见问题暂时还没生成出来，你也可以直接输入自己的问题开始提问。</p>`;
+  }
+
+  return `<div class="suggestion-grid">${questions.map(buildSuggestionChipMarkup).join('')}</div>`;
+}
+
+function buildDocumentReadyCardMarkup(documentInfo, options = {}) {
+  const {
+    state = 'loading',
+    questions = [],
+  } = options;
+  const title = escapeHtml(documentInfo.document_name || '当前文档');
+  const pageCount = Number(documentInfo.page_count || 0);
+  const pageCopy = pageCount > 0 ? `共 ${pageCount} 页，` : '';
+  const statusCopy = state === 'loading'
+    ? '正在整理中...'
+    : questions.length > 0
+      ? `${questions.length} 个推荐问题`
+      : '可直接输入问题';
+
+  return `
+      <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
+        <svg class="w-6 h-6 outline-none" fill="#4285f4" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+        </svg>
+      </div>
+      <div class="flex flex-col items-start w-full">
+        <section class="document-ready-card">
+          <div class="document-ready-badge">文档已就绪</div>
+          <div class="document-ready-header">
+            <h3>${title} 已成功上传并建立索引</h3>
+            <p>${pageCopy}可以直接点击下面的常见问题开始提问，也可以继续自由输入。</p>
+          </div>
+          <div class="document-ready-divider"></div>
+          <div class="document-ready-section-head">
+            <span class="document-ready-section-title">常见问题</span>
+            <span class="document-ready-section-meta">${statusCopy}</span>
+          </div>
+          ${buildSuggestedQuestionBody(state, questions)}
+        </section>
+      </div>`;
+}
+
+function upsertDocumentReadyCard(documentInfo, options = {}) {
+  const cardId = options.cardId || 'msg-' + Date.now();
+  const existingEl = document.getElementById(cardId);
+  const nextMarkup = buildDocumentReadyCardMarkup(documentInfo, options);
+
+  welcomeScreen.classList.add('hidden');
+  chatHistory.classList.remove('hidden');
+
+  if (existingEl) {
+    existingEl.className = 'flex gap-4 flex-row group';
+    existingEl.innerHTML = nextMarkup;
+  } else {
+    chatHistory.innerHTML += `
+      <div id="${cardId}" class="flex gap-4 flex-row group">
+        ${nextMarkup}
+      </div>`;
+  }
+
+  scrollToBottom();
+  return cardId;
+}
+
+async function fetchSuggestedQuestions(documentInfo, cardId = null) {
+  const targetCardId = upsertDocumentReadyCard(documentInfo, { cardId, state: 'loading' });
+
+  try {
+    const res = await fetch(`/api/rag/files/${encodeURIComponent(documentInfo.document_id)}/suggestions`);
+    if (!res.ok) {
+      upsertDocumentReadyCard(documentInfo, { cardId: targetCardId, state: 'error' });
+      return;
+    }
+    const data = await res.json();
+    if (Array.isArray(data.questions) && data.questions.length > 0) {
+      upsertDocumentReadyCard(
+        { ...documentInfo, document_name: data.document_name || documentInfo.document_name },
+        { cardId: targetCardId, state: 'ready', questions: data.questions }
+      );
+      return;
+    }
+
+    upsertDocumentReadyCard(documentInfo, { cardId: targetCardId, state: 'error' });
+  } catch (err) {
+    console.error(err);
+    upsertDocumentReadyCard(documentInfo, { cardId: targetCardId, state: 'error' });
+  }
+}
+
+function getStreamingThinkingMarkup(msgId) {
+  return `<div id="stream-thinking-${msgId}" class="flex items-center gap-1.5 py-1">
+    <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce" style="animation-delay:-0.3s"></div>
+    <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce" style="animation-delay:-0.15s"></div>
+    <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce"></div>
+    <span class="ml-1 text-[13px] text-[#80868b] dark:text-slate-400">正在生成回答...</span>
+  </div>`;
+}
+
+function buildStreamingShellBody(msgId, evidences = [], allCandidates = [], meta = {}) {
+  const metaHTML = buildMessageMetaMarkup(msgId, meta);
+  const evHTML = _buildEvidenceCards(msgId, evidences, allCandidates);
+  return `
+      <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
+        <svg class="w-6 h-6 outline-none" fill="#4285f4" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+        </svg>
+      </div>
+      <div class="flex flex-col gap-1 items-start w-full">
+        ${metaHTML}
+        <div id="stream-answer-${msgId}" class="text-[16px] leading-[1.8] text-[#1f1f1f] dark:text-slate-200 w-full markdown-body">
+          ${getStreamingThinkingMarkup(msgId)}
+        </div>
+        <div id="stream-evidence-${msgId}">${evHTML}</div>
+        <div id="stream-actions-${msgId}" class="flex gap-2 ml-2 opacity-0 group-hover:opacity-100 transition-opacity items-center mt-1"></div>
+      </div>`;
+}
+
+function prepareRetryMessageShell(msgId) {
+  const existingEl = document.getElementById(msgId);
+  if (!existingEl) return false;
+
+  existingEl.className = 'flex gap-4 flex-row group';
+  setMessageMeta(msgId, {});
+  existingEl.innerHTML = buildStreamingShellBody(msgId, [], [], {});
+  assistantMessageCache.set(msgId, '');
+  retryableRequests.delete(msgId);
+  scrollToBottom();
+  return true;
+}
+
+function isMessagesContainerNearBottom() {
+  if (!messagesContainer) return true;
+  const distanceFromBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight;
+  return distanceFromBottom <= STREAM_SCROLL_THRESHOLD;
+}
+
+function setSendButtonMode(mode) {
+  if (!sendBtn) return;
+
+  sendBtn.disabled = mode === 'stopping';
+
+  if (mode === 'stop') {
+    sendBtn.className = 'h-10 px-4 text-white rounded-full shrink-0 flex items-center justify-center gap-2 bg-gradient-to-r from-[#4285f4] to-[#6a8dff] hover:from-[#2f77ec] hover:to-[#5b7eff] shadow-[0_10px_24px_rgba(66,133,244,0.28)] transition-all border border-white/20';
+    sendBtn.innerHTML = STOP_BUTTON_HTML;
+    sendBtn.title = '停止生成';
+    sendBtn.setAttribute('aria-label', '停止生成');
+    return;
+  }
+
+  if (mode === 'stopping') {
+    sendBtn.className = 'h-10 px-4 text-white rounded-full shrink-0 flex items-center justify-center gap-2 bg-gradient-to-r from-[#7ba7f8] to-[#9ab8ff] transition-all border border-white/20 cursor-wait opacity-90 shadow-[0_10px_24px_rgba(66,133,244,0.18)]';
+    sendBtn.innerHTML = STOPPING_BUTTON_HTML;
+    sendBtn.title = '正在停止';
+    sendBtn.setAttribute('aria-label', '正在停止');
+    return;
+  }
+
+  sendBtn.className = 'p-2.5 text-white rounded-full shrink-0 flex items-center justify-center bg-gradient-to-r from-blue-500 to-blue-600 disabled:opacity-50 transition-all';
+  sendBtn.innerHTML = SEND_BUTTON_HTML;
+  sendBtn.title = '发送';
+  sendBtn.setAttribute('aria-label', '发送');
+}
+
+function resetActiveChatState() {
+  if (activeChat.renderFrame) {
+    cancelAnimationFrame(activeChat.renderFrame);
+  }
+
+  activeChat.controller = null;
+  activeChat.msgId = null;
+  activeChat.answerText = '';
+  activeChat.renderFrame = null;
+  activeChat.autoScroll = true;
+  activeChat.requestSnapshot = null;
+  activeChat.loadId = null;
+  activeChat.wasStopped = false;
+  activeChat.stopRequested = false;
+  setSendButtonMode('send');
+}
+
+function renderStreamingAnswer(msgId, answerText, options = {}) {
+  const { showCursor = false, fallbackHtml = '' } = options;
+  const answerEl = document.getElementById('stream-answer-' + msgId);
+  if (!answerEl) return;
+
+  const contentHtml = answerText
+    ? renderMarkdownWithCitations(msgId, answerText)
+    : fallbackHtml;
+  const cursorHtml = showCursor
+    ? `<span id="cursor-${msgId}" class="inline-block w-[2px] h-[1.1em] bg-current align-middle ml-0.5 animate-pulse opacity-70"></span>`
+    : '';
+
+  answerEl.innerHTML = contentHtml + cursorHtml;
+}
+
+function scheduleStreamRender() {
+  if (!activeChat.msgId || activeChat.renderFrame) return;
+
+  activeChat.renderFrame = requestAnimationFrame(() => {
+    activeChat.renderFrame = null;
+    renderStreamingAnswer(activeChat.msgId, activeChat.answerText, { showCursor: true });
+    scrollToBottom();
+  });
+}
+
+function flushStreamRender(options = {}) {
+  if (!activeChat.msgId) return;
+
+  if (activeChat.renderFrame) {
+    cancelAnimationFrame(activeChat.renderFrame);
+    activeChat.renderFrame = null;
+  }
+
+  renderStreamingAnswer(activeChat.msgId, activeChat.answerText, options);
+}
+
+async function copyAssistantMessage(msgId, button) {
+  const text = assistantMessageCache.get(msgId) || '';
+  if (!text) return;
+
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (err) {
+    console.error(err);
+    return;
+  }
+
+  const icon = button?.querySelector('svg');
+  if (!icon) return;
+  const previousIcon = icon.innerHTML;
+  icon.innerHTML = '<polyline points="20 6 9 17 4 12"></polyline>';
+  setTimeout(() => {
+    icon.innerHTML = previousIcon;
+  }, 1500);
+}
+
+function renderAssistantActions(msgId, options = {}) {
+  const {
+    showCopy = true,
+    retrySnapshot = null,
+    stopped = false,
+    statusLabel = stopped ? '已停止' : '',
+  } = options;
+  const actionsEl = document.getElementById('stream-actions-' + msgId);
+  if (!actionsEl) return;
+
+  if (retrySnapshot) {
+    retryableRequests.set(msgId, cloneRequestSnapshot(retrySnapshot));
+  } else {
+    retryableRequests.delete(msgId);
+  }
+
+  const actions = [];
+  if (statusLabel) {
+    actions.push(`<span class="text-[11px] font-medium text-[#80868b] dark:text-slate-400 mr-1">${statusLabel}</span>`);
+  }
+  if (retrySnapshot) {
+    actions.push(`<button onclick="retryAssistantMessage('${msgId}')" class="p-1.5 text-gray-500 dark:text-slate-400 hover:text-gray-700 dark:hover:text-slate-200 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors flex items-center gap-1.5 text-xs font-medium" title="重新生成"><svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 3v6h6"></path></svg><span>重试</span></button>`);
+  }
+  if (showCopy && (assistantMessageCache.get(msgId) || '').trim()) {
+    actions.push(`<button onclick="copyAssistantMessage('${msgId}', this)" class="p-1.5 text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors flex items-center gap-1.5 text-xs font-medium" title="复制结果"><svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg><span>复制</span></button>`);
+  }
+
+  actionsEl.innerHTML = actions.join('');
+  actionsEl.style.opacity = statusLabel || retrySnapshot ? '1' : '';
+}
+
+function finalizeRetryableErrorState(snapshot, message) {
+  if (!activeChat.msgId) {
+    addAssistantMessage(message);
+    return;
+  }
+
+  const retrySnapshot = cloneRequestSnapshot(snapshot || activeChat.requestSnapshot);
+  retrySnapshot.targetMsgId = activeChat.msgId;
+  const nextText = activeChat.answerText.trim()
+    ? `${activeChat.answerText}\n\n${message}`
+    : message;
+
+  activeChat.answerText = nextText;
+  flushStreamRender();
+  renderStreamingAnswer(activeChat.msgId, nextText);
+  assistantMessageCache.set(activeChat.msgId, nextText);
+  renderAssistantActions(activeChat.msgId, {
+    retrySnapshot,
+    statusLabel: '可重试',
+    showCopy: Boolean(nextText.trim()),
+  });
+  scrollToBottom();
+}
+
+function createStoppedMessageShell(snapshot) {
+  const msgId = 'msg-' + Date.now();
+  const retrySnapshot = cloneRequestSnapshot(snapshot);
+  retrySnapshot.targetMsgId = msgId;
+  chatHistory.innerHTML += `
+    <div id="${msgId}" class="flex gap-4 flex-row group">
+      <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
+        <svg class="w-6 h-6 outline-none" fill="#4285f4" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
+        </svg>
+      </div>
+      <div class="flex flex-col gap-1 items-start w-full">
+        <div id="stream-answer-${msgId}" class="text-[16px] leading-[1.8] text-[#1f1f1f] dark:text-slate-200 w-full markdown-body"></div>
+        <div id="stream-actions-${msgId}" class="flex gap-2 ml-2 opacity-0 group-hover:opacity-100 transition-opacity items-center mt-1"></div>
+      </div>
+    </div>`;
+
+  assistantMessageCache.set(msgId, '');
+  renderStreamingAnswer(msgId, '', {
+    fallbackHtml: '<p class="mb-0 text-[14px] text-[#80868b] dark:text-slate-400">已停止生成，保留当前内容；可点击重试从头重新回答当前问题。</p>',
+  });
+  renderAssistantActions(msgId, { retrySnapshot, stopped: true, showCopy: false });
+  scrollToBottom();
+  return msgId;
+}
+
+function finalizeCompletedStream(queryText) {
+  if (!activeChat.msgId) return;
+
+  flushStreamRender();
+  assistantMessageCache.set(activeChat.msgId, activeChat.answerText);
+  renderAssistantActions(activeChat.msgId, { showCopy: true });
+  scrollToBottom();
+
+  appendConversationTurn(queryText, activeChat.answerText);
+}
+
+function appendConversationTurn(queryText, answerText) {
+  conversationHistory.push({ role: 'user', content: queryText });
+  conversationHistory.push({ role: 'assistant', content: answerText });
+  if (conversationHistory.length > 20) {
+    conversationHistory = conversationHistory.slice(conversationHistory.length - 20);
+  }
+}
+
+function finalizeGuardedState(snapshot, payload = {}) {
+  const queryText = snapshot?.query || activeChat.requestSnapshot?.query || '';
+  const message = payload.message || '这个问题不属于当前文档问答范围，请换一个更贴近文档内容的问题。';
+
+  if (!activeChat.msgId) {
+    addAssistantMessage(message);
+    appendConversationTurn(queryText, message);
+    return;
+  }
+
+  activeChat.answerText = message;
+  flushStreamRender();
+  assistantMessageCache.set(activeChat.msgId, message);
+  renderAssistantActions(activeChat.msgId, { showCopy: true });
+  scrollToBottom();
+  appendConversationTurn(queryText, message);
+}
+
+function finalizeStoppedStream(snapshot) {
+  const retrySnapshot = cloneRequestSnapshot(snapshot);
+  const fallbackHtml = '<p class="mb-0 text-[14px] text-[#80868b] dark:text-slate-400">已停止生成，保留当前内容；可点击重试从头重新回答当前问题。</p>';
+
+  if (!activeChat.msgId) {
+    createStoppedMessageShell(retrySnapshot);
+    return;
+  }
+
+  retrySnapshot.targetMsgId = activeChat.msgId;
+  flushStreamRender({ fallbackHtml });
+  assistantMessageCache.set(activeChat.msgId, activeChat.answerText);
+  renderAssistantActions(activeChat.msgId, {
+    retrySnapshot,
+    stopped: true,
+    showCopy: Boolean(activeChat.answerText.trim()),
+  });
+  scrollToBottom();
+}
+
+function stopActiveChat() {
+  if (!isChatting || !activeChat.controller || activeChat.stopRequested) return;
+  activeChat.stopRequested = true;
+  activeChat.wasStopped = true;
+  setSendButtonMode('stopping');
+  activeChat.controller.abort();
+}
+
+function retryAssistantMessage(msgId) {
+  const snapshot = retryableRequests.get(msgId);
+  if (!snapshot || isChatting) return;
+  handleChat({
+    fromHistory: true,
+    queryText: snapshot.query,
+    reuseVisibleUserMessage: true,
+    requestSnapshot: snapshot,
+  });
+}
+
+setSendButtonMode('send');
 
 // Theme Management
 function initTheme() {
@@ -355,7 +915,7 @@ async function handleUpload(file) {
       // 若"已加载文档"弹窗此时处于打开状态，自动刷新列表无需用户手动关闭重开
       const _fm = document.getElementById('filesModal');
       if (_fm && !_fm.classList.contains('hidden')) openFilesModal();
-      addAssistantMessage(`✅ **${data.body.document_name}** 已成功上传并建立索引。现在，您可以就此文档向我提问了！`);
+      fetchSuggestedQuestions(data.body);
     } else {
       addAssistantMessage(`❌ 上传失败: ${data.body.detail}`);
     }
@@ -373,8 +933,14 @@ if (bottomFileInput) {
 }
 
 // Handle Chat
-async function handleChat(fromHistory = false) {
-  const text = queryInput.value.trim();
+async function handleChat(options = {}) {
+  const {
+    fromHistory = false,
+    queryText = queryInput.value.trim(),
+    reuseVisibleUserMessage = false,
+    requestSnapshot = null,
+  } = options;
+  const text = queryText.trim();
   if (!text || isChatting) return;
   
   if (!fromHistory) {
@@ -385,8 +951,12 @@ async function handleChat(fromHistory = false) {
   chatHistory.classList.remove("hidden");
   inputContainer.classList.remove("-translate-y-[25vh]", "md:-translate-y-[30vh]");
 
-  addUserMessage(text);
-  queryInput.value = "";
+  if (!reuseVisibleUserMessage) {
+    addUserMessage(text);
+  }
+  if (!queryText || queryText === queryInput.value.trim()) {
+    queryInput.value = "";
+  }
   
   if (uploadedDocs.length === 0) {
     addAssistantMessage("🤖 提示：请先点击下方上传一份文档～");
@@ -394,34 +964,47 @@ async function handleChat(fromHistory = false) {
   }
   
   isChatting = true;
-  const loadId = showLoading();
+  activeChat.controller = new AbortController();
+  activeChat.msgId = requestSnapshot?.targetMsgId || null;
+  activeChat.answerText = '';
+  activeChat.autoScroll = true;
+  activeChat.requestSnapshot = buildRequestSnapshot(text, requestSnapshot);
+  if (activeChat.msgId && !prepareRetryMessageShell(activeChat.msgId)) {
+    activeChat.msgId = null;
+    activeChat.requestSnapshot.targetMsgId = null;
+  }
+  activeChat.loadId = activeChat.msgId ? null : showLoading();
+  activeChat.wasStopped = false;
+  setSendButtonMode('stop');
 
   try {
     const res = await fetch('/api/rag/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: activeChat.controller.signal,
       body: JSON.stringify({
-        query: text,
-        top_k: 5,
-        chat_history: conversationHistory,
-        ...(selectedDocIds ? { document_ids: selectedDocIds } : {})
+        query: activeChat.requestSnapshot.query,
+        top_k: activeChat.requestSnapshot.top_k,
+        chat_history: activeChat.requestSnapshot.chatHistory,
+        ...(activeChat.requestSnapshot.selectedDocIds ? { document_ids: activeChat.requestSnapshot.selectedDocIds } : {})
       })
     });
 
     if (!res.ok) {
       const errData = await res.json().catch(() => ({ detail: res.statusText }));
-      removeLoading(loadId);
-      addAssistantMessage(`❌ Error: ${errData.detail}`);
+      removeLoading(activeChat.loadId);
+      activeChat.loadId = null;
+      finalizeRetryableErrorState(activeChat.requestSnapshot, `❌ Error: ${errData.detail}`);
       return;
     }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let answerText = '';
-    let msgId = null;
+    let completed = false;
+    let streamFinished = false;
 
-    while (true) {
+    while (!streamFinished) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
@@ -433,64 +1016,79 @@ async function handleChat(fromHistory = false) {
         const raw = line.slice(6).trim();
 
         if (raw === '[DONE]') {
-          if (msgId) {
-            // Remove typing cursor
-            const cursor = document.getElementById('cursor-' + msgId);
-            if (cursor) cursor.remove();
-            // Add copy button
-            const actionsEl = document.getElementById('stream-actions-' + msgId);
-            if (actionsEl) {
-              const escaped = answerText.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');
-              actionsEl.innerHTML = `<button onclick="navigator.clipboard.writeText('${escaped}'); const i=this.querySelector('svg'); const old=i.innerHTML; i.innerHTML='<polyline points=\\'20 6 9 17 4 12\\'></polyline>'; setTimeout(()=>i.innerHTML=old,1500);" class="p-1.5 text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors flex items-center gap-1.5 text-xs font-medium" title="复制结果"><svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg><span>复制</span></button>`;
-              actionsEl.classList.remove('opacity-0');
-              actionsEl.classList.add('opacity-0'); // stays hidden until hover via group
-            }
-            // Save multi-turn history (cap at 20 messages = 10 turns)
-            conversationHistory.push({ role: 'user', content: text });
-            conversationHistory.push({ role: 'assistant', content: answerText });
-            if (conversationHistory.length > 20) {
-              conversationHistory = conversationHistory.slice(conversationHistory.length - 20);
-            }
-          }
+          completed = true;
+          finalizeCompletedStream(text);
+          streamFinished = true;
           break;
         }
 
         let event;
         try { event = JSON.parse(raw); } catch { continue; }
 
+        if (event.type === 'guarded') {
+          removeLoading(activeChat.loadId);
+          activeChat.loadId = null;
+          finalizeGuardedState(activeChat.requestSnapshot, event.data);
+          return;
+        }
+
         if (event.type === 'error') {
-          removeLoading(loadId);
-          addAssistantMessage(event.data);
+          removeLoading(activeChat.loadId);
+          activeChat.loadId = null;
+          finalizeRetryableErrorState(activeChat.requestSnapshot, event.data);
           return;
         }
 
         if (event.type === 'evidences') {
-          removeLoading(loadId);
-          msgId = 'msg-' + Date.now();
-          _insertStreamingShell(msgId, event.data.evidences, event.data.all_candidates);
+          removeLoading(activeChat.loadId);
+          activeChat.loadId = null;
+          if (!activeChat.msgId) {
+            activeChat.msgId = 'msg-' + Date.now();
+            activeChat.requestSnapshot.targetMsgId = activeChat.msgId;
+          }
+          if (event.data.retrieval_timing) {
+            console.info('[Retrieval timing]', event.data.retrieval_timing);
+          }
+          _insertStreamingShell(activeChat.msgId, event.data.evidences, event.data.all_candidates, {
+            confidence: event.data.confidence,
+            retrievalTiming: event.data.retrieval_timing,
+          });
         }
 
-        if (event.type === 'token' && msgId) {
-          answerText += event.data;
-          const answerEl = document.getElementById('stream-answer-' + msgId);
-          if (answerEl) {
-            answerEl.innerHTML = marked.parse(answerText) +
-              `<span id="cursor-${msgId}" class="inline-block w-[2px] h-[1.1em] bg-current align-middle ml-0.5 animate-pulse opacity-70"></span>`;
-          }
-          scrollToBottom();
+        if (event.type === 'token' && activeChat.msgId) {
+          activeChat.answerText += event.data;
+          scheduleStreamRender();
         }
       }
     }
+
+    if (!completed && activeChat.msgId && !activeChat.wasStopped) {
+      finalizeCompletedStream(text);
+    }
   } catch (err) {
-    removeLoading(loadId);
-    addAssistantMessage(`❌ 网络错误，请重试。`);
+    removeLoading(activeChat.loadId);
+    activeChat.loadId = null;
+
+    if (err?.name === 'AbortError' || activeChat.wasStopped) {
+      finalizeStoppedStream(activeChat.requestSnapshot);
+      return;
+    }
+
+    finalizeRetryableErrorState(activeChat.requestSnapshot, '❌ 网络错误，请重试。');
   } finally {
     isChatting = false;
+    resetActiveChatState();
   }
 }
 
 if (sendBtn) {
-  sendBtn.addEventListener('click', handleChat);
+  sendBtn.addEventListener('click', () => {
+    if (isChatting) {
+      stopActiveChat();
+      return;
+    }
+    handleChat();
+  });
 }
 if (queryInput) {
   queryInput.addEventListener('keydown', (e) => {
@@ -499,6 +1097,13 @@ if (queryInput) {
       e.preventDefault();
       handleChat();
     }
+  });
+}
+
+if (messagesContainer) {
+  messagesContainer.addEventListener('scroll', () => {
+    if (!isChatting) return;
+    activeChat.autoScroll = isMessagesContainerNearBottom();
   });
 }
 
@@ -528,7 +1133,9 @@ window.addEventListener('popstate', (e) => {
 
 // UI Helpers
 function scrollToBottom() {
-  messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+  if (!messagesContainer) return;
+  if (isChatting && !activeChat.autoScroll) return;
+  messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
 
 function escapeHtml(text) {
@@ -566,17 +1173,24 @@ function addUserMessage(text) {
   scrollToBottom();
 }
 
-function _buildEvidenceCards(evidences, allCandidates) {
+function _buildEvidenceCards(msgId, evidences, allCandidates) {
   if (!evidences || evidences.length === 0) return '';
   const cards = evidences.map(ev => {
     const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
+    const evidenceBadge = ev.evidence_id
+      ? `<span class="evidence-chip">${ev.evidence_id}</span>`
+      : '';
+    const evidenceAttrs = ev.evidence_id
+      ? `id="evidence-${msgId}-${ev.evidence_id}" data-evidence-id="${ev.evidence_id}"`
+      : '';
     return `
-      <div class="w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}')">
+      <div ${evidenceAttrs} class="evidence-card w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}')">
         <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: 4/3;">
           <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
           <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 dark:group-hover:bg-white/10 transition-colors flex items-center justify-center">
             <svg class="w-6 h-6 text-white opacity-0 group-hover:opacity-100 transition-opacity drop-shadow-md" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
           </div>
+          <div class="absolute top-1.5 right-1.5">${evidenceBadge}</div>
         </div>
         <div class="p-2.5">
           <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
@@ -607,7 +1221,7 @@ function _buildEvidenceCards(evidences, allCandidates) {
         </div>`;
     }).join('');
     disclosureHtml = `
-      <div class="mt-2 w-full">
+      <div class="mt-4 w-full">
         <button onclick="(function(btn){var grid=document.getElementById('${toggleId}');var isHidden=grid.style.display==='none';grid.style.display=isHidden?'grid':'none';btn.querySelector('svg').style.transform=isHidden?'rotate(180deg)':''})(this)" class="flex items-center gap-1.5 text-[11px] font-semibold text-[#80868b] dark:text-slate-400 hover:text-[#4285f4] dark:hover:text-blue-400 transition-colors mb-2 pl-1 uppercase tracking-wider">
           <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 transition-transform duration-200" style="transform:none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
           查看全部候选页 (${unused.length} 未采用)
@@ -617,35 +1231,36 @@ function _buildEvidenceCards(evidences, allCandidates) {
   }
 
   return `
-    <div class="mt-3 w-full">
-      <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-2 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
-      <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">${cards}</div>
-      ${disclosureHtml}
+    <div class="mt-4 w-full evidence-disclosure">
+      <button id="evidence-toggle-${msgId}" data-count="${evidences.length}" type="button" onclick="toggleEvidenceSection('${msgId}')" aria-expanded="false" class="evidence-disclosure-toggle">
+        <span class="evidence-disclosure-copy">
+          <span class="evidence-disclosure-title" data-evidence-label>查看依据</span>
+          <span class="evidence-disclosure-meta" data-evidence-meta>默认收起 · 共 ${evidences.length} 条依据</span>
+        </span>
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 transition-transform duration-200" style="transform:rotate(0deg)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+      </button>
+      <div id="evidence-body-${msgId}" style="display:none" class="evidence-disclosure-body">
+        <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-3 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">${cards}</div>
+        ${disclosureHtml}
+      </div>
     </div>`;
 }
 
 function _insertStreamingShell(msgId, evidences, allCandidates) {
-  const evHTML = _buildEvidenceCards(evidences, allCandidates);
-  chatHistory.innerHTML += `
+  const meta = arguments[3] || {};
+  setMessageMeta(msgId, { evidences, allCandidates, ...meta });
+  const existingEl = document.getElementById(msgId);
+  if (existingEl) {
+    existingEl.className = 'flex gap-4 flex-row group';
+    existingEl.innerHTML = buildStreamingShellBody(msgId, evidences, allCandidates, meta);
+  } else {
+    chatHistory.innerHTML += `
     <div id="${msgId}" class="flex gap-4 flex-row group">
-      <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1">
-        <svg class="w-6 h-6 outline-none" fill="#4285f4" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-          <path d="M12 2.628c-.896 5.867-5.505 10.476-11.372 11.372 5.867.896 10.476 5.505 11.372 11.372.896-5.867 5.505-10.476 11.372-11.372-5.867-.896-10.476-5.505-11.372-11.372z"/>
-        </svg>
-      </div>
-      <div class="flex flex-col gap-1 items-start w-full">
-        <div id="stream-answer-${msgId}" class="text-[16px] leading-[1.8] text-[#1f1f1f] dark:text-slate-200 w-full markdown-body">
-          <div id="stream-thinking-${msgId}" class="flex items-center gap-1.5 py-1">
-            <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce" style="animation-delay:-0.3s"></div>
-            <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce" style="animation-delay:-0.15s"></div>
-            <div class="w-1.5 h-1.5 bg-[#4285f4] opacity-70 rounded-full animate-bounce"></div>
-            <span class="ml-1 text-[13px] text-[#80868b] dark:text-slate-400">正在生成回答...</span>
-          </div>
-        </div>
-        ${evHTML}
-        <div id="stream-actions-${msgId}" class="flex gap-2 ml-2 opacity-0 group-hover:opacity-100 transition-opacity items-center mt-1"></div>
-      </div>
+      ${buildStreamingShellBody(msgId, evidences, allCandidates, meta)}
     </div>`;
+  }
+  assistantMessageCache.set(msgId, '');
   scrollToBottom();
 }
 
@@ -653,10 +1268,12 @@ function addAssistantMessage(markdownText, evidences = []) {
   welcomeScreen.classList.add("hidden");
   chatHistory.classList.remove("hidden");
 
-  const evHTML = _buildEvidenceCards(evidences);
+  const msgId = 'msg-' + Date.now();
+  setMessageMeta(msgId, { evidences });
+  const evHTML = _buildEvidenceCards(msgId, evidences, []);
 
-  const htmlContent = marked.parse(markdownText);
-  const escapedMd = markdownText.replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\n/g, '\\n');
+  const htmlContent = renderMarkdownWithCitations(msgId, markdownText);
+  assistantMessageCache.set(msgId, markdownText);
   
   chatHistory.innerHTML += `
     <div class="flex gap-4 flex-row group">
@@ -671,15 +1288,12 @@ function addAssistantMessage(markdownText, evidences = []) {
         </div>
         ${evHTML}
         <!-- Action Bar: Visible only on hover -->
-        <div class="flex gap-2 ml-2 opacity-0 group-hover:opacity-100 transition-opacity items-center mt-1">
-          <button onclick="navigator.clipboard.writeText('${escapedMd}'); const i=this.querySelector('svg'); const old=i.innerHTML; i.innerHTML='<polyline points=\\'20 6 9 17 4 12\\'></polyline>'; setTimeout(()=>i.innerHTML=old, 1500);" class="p-1.5 text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors flex items-center gap-1.5 text-xs text-gray-500 dark:text-slate-400 font-medium" title="复制结果">
-            <svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-            <span>复制</span>
-          </button>
+        <div id="stream-actions-${msgId}" class="flex gap-2 ml-2 opacity-0 group-hover:opacity-100 transition-opacity items-center mt-1">
         </div>
       </div>
     </div>
   `;
+  renderAssistantActions(msgId, { showCopy: true });
   scrollToBottom();
 }
 
