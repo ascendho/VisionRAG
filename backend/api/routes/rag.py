@@ -1,4 +1,5 @@
-from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Request
+import asyncio
+from fastapi import APIRouter, BackgroundTasks, File, UploadFile, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
@@ -771,8 +772,300 @@ def delete_file(document_id: str):
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".pptx"}
 
+_UPLOAD_STAGE_RANGES = {
+    "queued": (15.0, 15.0),
+    "rendering": (15.0, 35.0),
+    "embedding": (35.0, 85.0),
+    "upserting": (85.0, 98.0),
+    "done": (100.0, 100.0),
+}
+
+
+def _get_upload_job_manager_or_raise():
+    from backend.main import upload_job_manager
+
+    if upload_job_manager is None:
+        raise RuntimeError("上传任务管理器尚未就绪")
+    return upload_job_manager
+
+
+def _get_vector_store_or_raise():
+    from backend.main import vector_store_instance
+
+    if vector_store_instance is None:
+        raise RuntimeError("Qdrant 后端尚未就绪")
+    return vector_store_instance
+
+
+def _compute_stage_progress(stage: str, current: int = 0, total: int = 0) -> float:
+    if stage == "done":
+        return 100.0
+
+    start, end = _UPLOAD_STAGE_RANGES.get(stage, (0.0, 0.0))
+    if total <= 0 or end <= start:
+        return round(end, 1)
+
+    ratio = max(0.0, min(float(current) / float(total), 1.0))
+    return round(start + (end - start) * ratio, 1)
+
+
+def _build_upload_stage_message(stage: str, suffix: str) -> str:
+    if stage == "queued":
+        return "文件已上传，等待开始处理..."
+    if stage == "rendering":
+        if suffix == ".pdf":
+            return "正在将 PDF 转为页面图..."
+        if suffix == ".pptx":
+            return "正在将 PPTX 转为页面图..."
+        return "正在整理图片页面..."
+    if stage == "embedding":
+        return "正在建立 ColPali 视觉索引..."
+    if stage == "upserting":
+        return "正在写入向量库..."
+    if stage == "done":
+        return "文档已完成解析并建立索引。"
+    if stage == "error":
+        return "文档处理失败。"
+    return "处理中..."
+
+
+def _update_upload_job(
+    task_id: str,
+    *,
+    stage: str,
+    suffix: str,
+    status: Optional[str] = None,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+    progress_percent: Optional[float] = None,
+    message: Optional[str] = None,
+    **fields,
+) -> Optional[Dict[str, Any]]:
+    manager = _get_upload_job_manager_or_raise()
+    previous_job = manager.get_job(task_id) or {}
+    resolved_current = int(current if current is not None else previous_job.get("stage_current", 0) or 0)
+    resolved_total = int(total if total is not None else previous_job.get("stage_total", 0) or 0)
+
+    if progress_percent is None:
+        if stage == "error":
+            progress_percent = float(previous_job.get("progress_percent", 0.0) or 0.0)
+        else:
+            progress_percent = _compute_stage_progress(stage, resolved_current, resolved_total)
+
+    payload = {
+        "status": status or ("done" if stage == "done" else "error" if stage == "error" else "running"),
+        "stage": stage,
+        "message": message or _build_upload_stage_message(stage, suffix),
+        "progress_percent": float(progress_percent),
+        "stage_current": resolved_current,
+        "stage_total": resolved_total,
+    }
+    payload.update(fields)
+    return manager.update_job(task_id, **payload)
+
+
+def _run_upload_job(task_id: str, temp_path: str, original_filename: str, suffix: str) -> None:
+    final_file_path = None
+    image_paths: List[str] = []
+    document_id = ""
+
+    try:
+        vector_store_instance = _get_vector_store_or_raise()
+        document_id = get_file_hash(temp_path)
+        _update_upload_job(
+            task_id,
+            stage="queued",
+            status="queued",
+            suffix=suffix,
+            progress_percent=15.0,
+        )
+
+        render_start = time.perf_counter()
+
+        def on_render_progress(current: int, total: int) -> None:
+            _update_upload_job(
+                task_id,
+                stage="rendering",
+                suffix=suffix,
+                current=current,
+                total=total,
+                page_count=max(int(total), 0),
+            )
+
+        _update_upload_job(task_id, stage="rendering", suffix=suffix, current=0, total=1)
+        if suffix == ".pdf":
+            image_paths = process_pdf_to_images(temp_path, on_progress=on_render_progress)
+        elif suffix == ".pptx":
+            image_paths = process_pptx_to_images(temp_path, on_progress=on_render_progress)
+        else:
+            image_paths = process_image_to_images(temp_path, on_progress=on_render_progress)
+
+        document_render_ms = (time.perf_counter() - render_start) * 1000
+        if not image_paths:
+            raise RuntimeError("未能成功解析出任何页面图像")
+
+        safe_filename = (original_filename or os.path.basename(temp_path) or "uploaded_file")
+        safe_filename = safe_filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
+        stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+        os.makedirs(stored_files_dir, exist_ok=True)
+        final_file_path = os.path.join(stored_files_dir, f"{document_id}_{safe_filename}")
+        shutil.copy(temp_path, final_file_path)
+
+        _update_upload_job(
+            task_id,
+            stage="embedding",
+            suffix=suffix,
+            current=0,
+            total=max(len(image_paths), 1),
+            page_count=len(image_paths),
+            timing={"document_render_ms": round(document_render_ms, 2)},
+        )
+
+        def on_index_progress(event: Dict[str, Any]) -> None:
+            stage = str(event.get("stage") or "embedding")
+            completed = int(event.get("completed") or 0)
+            total = int(event.get("total") or len(image_paths) or 1)
+            _update_upload_job(
+                task_id,
+                stage=stage,
+                suffix=suffix,
+                current=completed,
+                total=total,
+                page_count=len(image_paths),
+            )
+
+        index_result = vector_store_instance.embed_and_store_documents(
+            image_paths=image_paths,
+            document_id=document_id,
+            document_name=original_filename,
+            on_progress=on_index_progress,
+        )
+        if not index_result.get("ok"):
+            raise RuntimeError("存储多模态特征库发生意外错误")
+
+        upload_timing = {
+            "document_render_ms": round(document_render_ms, 2),
+            **index_result.get("timing", {}),
+        }
+        logger.info("upload_timing file=%s timing=%s", original_filename, upload_timing)
+        print(
+            "[Upload] "
+            f"file={original_filename} render={upload_timing['document_render_ms']}ms "
+            f"embed={upload_timing.get('embedding_ms', 0)}ms build={upload_timing.get('point_build_ms', 0)}ms "
+            f"upsert={upload_timing.get('qdrant_upsert_ms', 0)}ms total_index={upload_timing.get('total_index_ms', 0)}ms"
+        )
+
+        result_payload = {
+            "status": "success",
+            "document_id": document_id,
+            "document_name": original_filename,
+            "page_count": len(image_paths),
+            "timing": upload_timing,
+        }
+        _update_upload_job(
+            task_id,
+            stage="done",
+            status="done",
+            suffix=suffix,
+            progress_percent=100.0,
+            page_count=len(image_paths),
+            timing=upload_timing,
+            result=result_payload,
+            error=None,
+        )
+    except Exception as exc:
+        logger.exception("upload_job_failed task_id=%s filename=%s", task_id, original_filename)
+        error_message = str(exc).strip() or "未知错误"
+        try:
+            vector_store_instance = _get_vector_store_or_raise()
+            if document_id:
+                vector_store_instance.delete_document(document_id)
+        except Exception:
+            logger.exception("upload_job_cleanup_failed task_id=%s document_id=%s", task_id, document_id)
+
+        if final_file_path and os.path.exists(final_file_path):
+            try:
+                os.remove(final_file_path)
+            except OSError:
+                logger.warning("failed_to_remove_failed_upload_file path=%s", final_file_path)
+
+        _update_upload_job(
+            task_id,
+            stage="error",
+            status="error",
+            suffix=suffix,
+            message=f"文档处理失败：{error_message}",
+            error=error_message,
+        )
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+@router.get("/jobs/{task_id}")
+def get_upload_job(task_id: str):
+    try:
+        job = _get_upload_job_manager_or_raise().get_job(task_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="上传任务不存在或已过期")
+    return {"status": "success", "job": job}
+
+
+@router.get("/jobs/{task_id}/events")
+async def stream_upload_job_events(task_id: str, request: Request):
+    try:
+        manager = _get_upload_job_manager_or_raise()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    initial_job = manager.get_job(task_id)
+    if initial_job is None:
+        raise HTTPException(status_code=404, detail="上传任务不存在或已过期")
+
+    async def event_stream():
+        last_revision = -1
+        while True:
+            if await request.is_disconnected():
+                break
+
+            job = manager.get_job(task_id)
+            if job is None:
+                payload = {"type": "error", "data": {"message": "上传任务不存在或已过期"}}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                break
+
+            revision = int(job.get("revision", 0) or 0)
+            if revision != last_revision:
+                event_type = "progress"
+                if job.get("status") == "done":
+                    event_type = "done"
+                elif job.get("status") == "error":
+                    event_type = "error"
+
+                payload = {"type": event_type, "data": job}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                last_revision = revision
+
+                if event_type in {"done", "error"}:
+                    break
+
+            await asyncio.sleep(0.35)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 @router.post("/upload")
-def upload_file(file: UploadFile = File(...)):
+def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
     接收视觉文档文件，处理为页面缓存与向量特征。
     支持格式：PDF / PNG / JPG / JPEG / WEBP / PPTX
@@ -783,76 +1076,40 @@ def upload_file(file: UploadFile = File(...)):
     tmp = tempfile.NamedTemporaryFile(prefix="rag_upload_", suffix=suffix, delete=False)
     temp_path = tmp.name
     tmp.close()
+    job_scheduled = False
     try:
         # 将流保存到本地临时文件
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
-        # 1. 解析文件到图像缓存
-        image_render_start = time.perf_counter()
-        if suffix == ".pdf":
-            image_paths = process_pdf_to_images(temp_path)
-        elif suffix == ".pptx":
-            image_paths = process_pptx_to_images(temp_path)
-        else:
-            image_paths = process_image_to_images(temp_path)
-        document_render_ms = (time.perf_counter() - image_render_start) * 1000
-        
-        if not image_paths:
-            raise HTTPException(status_code=500, detail="未能成功解析出任何页面图像")
-
         file_hash = get_file_hash(temp_path)
-        safe_filename = file.filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
-        
-        # 保存原始上传文件，目录名继续沿用 pdfs 以兼容已有数据。
-        stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-        os.makedirs(stored_files_dir, exist_ok=True)
-        final_file_path = os.path.join(stored_files_dir, f"{file_hash}_{safe_filename}")
-        shutil.copy(temp_path, final_file_path)
-        
-        # 避免并发时引错库，延迟导入或从全局拿， 这里我们可以从全局获取 vector_store_instance，或者重新调单例
-        # 为简单起见，从 main 导入全局实例
-        from backend.main import vector_store_instance
-        
-        if vector_store_instance is None:
-            raise HTTPException(status_code=500, detail="Qdrant 后端尚未就绪")
-
-        # 2. 将图片转换为 ColPali 向量并建立索引
-        index_result = vector_store_instance.embed_and_store_documents(
-            image_paths=image_paths,
+        job = _get_upload_job_manager_or_raise().create_job(
+            filename=file.filename or os.path.basename(temp_path),
             document_id=file_hash,
-            document_name=file.filename
         )
-
-        if not index_result.get("ok"):
-            raise HTTPException(status_code=500, detail="存储多模态特征库发生意外错误")
-
-        upload_timing = {
-            "document_render_ms": round(document_render_ms, 2),
-            **index_result.get("timing", {}),
-        }
-        logger.info("upload_timing file=%s timing=%s", file.filename, upload_timing)
-        print(
-            "[Upload] "
-            f"file={file.filename} render={upload_timing['document_render_ms']}ms "
-            f"embed={upload_timing.get('embedding_ms', 0)}ms build={upload_timing.get('point_build_ms', 0)}ms "
-            f"upsert={upload_timing.get('qdrant_upsert_ms', 0)}ms total_index={upload_timing.get('total_index_ms', 0)}ms"
+        background_tasks.add_task(
+            _run_upload_job,
+            job["task_id"],
+            temp_path,
+            file.filename or os.path.basename(temp_path),
+            suffix,
         )
-
+        job_scheduled = True
         return {
-            "status": "success",
+            "status": "accepted",
+            "task_id": job["task_id"],
             "document_id": file_hash,
             "document_name": file.filename,
-            "page_count": len(image_paths),
-            "timing": upload_timing,
+            "job": job,
         }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # 无论成功错误，清除临时文件
-        if os.path.exists(temp_path):
+        # 已交给后台任务后，临时文件由任务自己清理。
+        if not job_scheduled and os.path.exists(temp_path):
             os.remove(temp_path)
 
 

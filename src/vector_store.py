@@ -15,7 +15,7 @@
 import hashlib
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import warnings
 
 import numpy as np
@@ -150,30 +150,48 @@ class VisionVectorStore:
         上层如果传入 document_ids，就只在指定文档范围内检索；
         否则默认在整库中搜索。
         """
+        conditions: List[Any] = [self._build_ready_document_condition()]
+
         if not document_ids:
-            return None
+            return models.Filter(must=conditions)
 
         clean_ids = sorted({doc_id for doc_id in document_ids if doc_id})
         if not clean_ids:
-            return None
+            return models.Filter(must=conditions)
 
         if len(clean_ids) == 1:
-            return models.Filter(
-                must=[
+            conditions.append(
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=clean_ids[0]),
+                )
+            )
+            return models.Filter(must=conditions)
+
+        conditions.append(
+            models.Filter(
+                should=[
                     models.FieldCondition(
                         key="document_id",
-                        match=models.MatchValue(value=clean_ids[0]),
+                        match=models.MatchValue(value=doc_id),
                     )
+                    for doc_id in clean_ids
                 ]
             )
+        )
 
+        return models.Filter(must=conditions)
+
+    def _build_ready_document_condition(self) -> models.Filter:
         return models.Filter(
             should=[
                 models.FieldCondition(
-                    key="document_id",
-                    match=models.MatchValue(value=doc_id),
-                )
-                for doc_id in clean_ids
+                    key="index_ready",
+                    match=models.MatchValue(value=True),
+                ),
+                models.IsNullCondition(
+                    is_null=models.PayloadField(key="index_ready"),
+                ),
             ]
         )
 
@@ -207,6 +225,7 @@ class VisionVectorStore:
         document_name: Optional[str] = None,
         batch_size: int = 4,
         replace_document: bool = True,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
         **_ignored,
     ) -> Dict[str, Any]:
         """
@@ -250,6 +269,14 @@ class VisionVectorStore:
                     # 输出结果不是单个向量，而是一页对应多个 token 向量的多向量表示。
                     image_embeddings = self.model(**batch_inputs)
                 embedding_ms += (time.perf_counter() - embedding_start) * 1000
+                if on_progress:
+                    on_progress(
+                        {
+                            "stage": "embedding",
+                            "completed": min(i + len(batch_paths), total_images),
+                            "total": total_images,
+                        }
+                    )
             finally:
                 # PIL 句柄及时关闭，避免大批量处理时文件句柄和内存积累。
                 for img in images:
@@ -279,6 +306,7 @@ class VisionVectorStore:
                         "document_id": document_id,
                         "document_name": document_name,
                         "page_number": page_number,
+                        "index_ready": False,
                     }
                 )
                 points.append(point)
@@ -304,10 +332,32 @@ class VisionVectorStore:
         upsert_batch_size = 8
         upsert_start = time.perf_counter()
         for i in range(0, len(points), upsert_batch_size):
+            batch_points = points[i:i + upsert_batch_size]
             self.qdrant.upsert(
                 collection_name=COLLECTION_NAME,
-                points=points[i:i + upsert_batch_size]
+                points=batch_points
             )
+            if on_progress:
+                on_progress(
+                    {
+                        "stage": "upserting",
+                        "completed": min(i + len(batch_points), len(points)),
+                        "total": len(points),
+                    }
+                )
+
+        self.qdrant.set_payload(
+            collection_name=COLLECTION_NAME,
+            payload={"index_ready": True},
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="document_id",
+                        match=models.MatchValue(value=document_id),
+                    )
+                ]
+            ),
+        )
         qdrant_upsert_ms = (time.perf_counter() - upsert_start) * 1000
         total_index_ms = (time.perf_counter() - total_index_start) * 1000
         timing = {
@@ -337,6 +387,7 @@ class VisionVectorStore:
         try:
             records, _ = self.qdrant.scroll(
                 collection_name=COLLECTION_NAME,
+                scroll_filter=self._build_document_filter(None),
                 with_payload=["document_id", "document_name", "page_number"],
                 with_vectors=False,
                 limit=10000
@@ -369,6 +420,7 @@ class VisionVectorStore:
                 collection_name=COLLECTION_NAME,
                 scroll_filter=models.Filter(
                     must=[
+                        self._build_ready_document_condition(),
                         models.FieldCondition(
                             key="document_id",
                             match=models.MatchValue(value=document_id),
@@ -416,6 +468,7 @@ class VisionVectorStore:
                 collection_name=COLLECTION_NAME,
                 scroll_filter=models.Filter(
                     must=[
+                        self._build_ready_document_condition(),
                         models.FieldCondition(
                             key="document_id",
                             match=models.MatchValue(value=document_id),

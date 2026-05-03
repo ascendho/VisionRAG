@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
-from typing import List
+from typing import Callable, List, Optional
 from PIL import Image, ImageDraw, ImageFont
 from pdf2image import convert_from_path
 from src.config import IMAGE_CACHE_DIR
@@ -114,7 +114,12 @@ def _find_soffice_binary() -> str | None:
     return None
 
 
-def process_pdf_to_images(pdf_path: str, dpi: int = 150, cache_key: str | None = None) -> List[str]:
+def process_pdf_to_images(
+    pdf_path: str,
+    dpi: int = 150,
+    cache_key: str | None = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> List[str]:
     """
     将 PDF 文件的每一页分别转为高质量 PNG 截图并保存到缓存目录。
     这是整个 Vision RAG 流程最关键的输入转换步骤之一。
@@ -160,11 +165,17 @@ def process_pdf_to_images(pdf_path: str, dpi: int = 150, cache_key: str | None =
             
         # 后续向量化和前端证据展示都依赖这条物理路径。
         image_paths.append(image_path)
+        if on_progress:
+            on_progress(i + 1, len(pages))
         
     return image_paths
 
 
-def process_pptx_to_images(pptx_path: str, dpi: int = 150) -> List[str]:
+def process_pptx_to_images(
+    pptx_path: str,
+    dpi: int = 150,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> List[str]:
     """将 PPTX 先转成 PDF，再复用现有 PDF 渲染链路生成页面图。"""
     soffice_binary = _find_soffice_binary()
     if not soffice_binary:
@@ -194,10 +205,18 @@ def process_pptx_to_images(pptx_path: str, dpi: int = 150) -> List[str]:
         if not os.path.exists(converted_pdf_path):
             raise RuntimeError("PPTX 转 PDF 失败：未找到转换后的 PDF 文件")
 
-        return process_pdf_to_images(converted_pdf_path, dpi=dpi, cache_key=cache_key)
+        return process_pdf_to_images(
+            converted_pdf_path,
+            dpi=dpi,
+            cache_key=cache_key,
+            on_progress=on_progress,
+        )
 
 
-def process_image_to_images(image_path: str) -> List[str]:
+def process_image_to_images(
+    image_path: str,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> List[str]:
     """
     处理单张图片文件（PNG/JPG/JPEG/WEBP），将其作为"单页文档"纳入索引。
     这条路径比 PDF 简单，因为输入本来就是图片，但仍然要做一次格式标准化：
@@ -221,10 +240,16 @@ def process_image_to_images(image_path: str) -> List[str]:
         img = Image.open(image_path).convert("RGB")
         img.save(cached_path, "PNG")
 
+    if on_progress:
+        on_progress(1, 1)
+
     return [cached_path]
 
 
-def process_text_to_images(text_path: str) -> List[str]:
+def process_text_to_images(
+    text_path: str,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> List[str]:
     """
     将纯文本文件（.txt / .md）渲染为图像页面，使其可被 ColPali 建立视觉索引。
 
@@ -284,6 +309,7 @@ def process_text_to_images(text_path: str) -> List[str]:
 
     # 根据页面高度计算一页最多能容纳多少条展示行。
     max_lines_per_page = (_TEXT_PAGE_H - 2 * _TEXT_MARGIN) // _TEXT_LINE_HEIGHT
+    total_pages = max(1, (len(display_lines) + max_lines_per_page - 1) // max_lines_per_page)
 
     image_paths: List[str] = []
     page_num = 0
@@ -310,5 +336,7 @@ def process_text_to_images(text_path: str) -> List[str]:
         img.save(cached_path, "PNG")
 
         image_paths.append(cached_path)
+        if on_progress:
+            on_progress(page_num, total_pages)
 
     return image_paths

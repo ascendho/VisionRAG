@@ -922,7 +922,7 @@ function showUploadingAnimation(text) {
           <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.3s"></div>
           <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce" style="animation-delay: -0.15s"></div>
           <div class="w-2 h-2 bg-[#4285f4] opacity-90 rounded-full animate-bounce"></div>
-          <span class="ml-3 text-[14px] font-medium text-[#444746] dark:text-slate-300">${text || '正在提取与建立索引...'}</span>
+          <span id="upload-progress-label-${id}" class="ml-3 text-[14px] font-medium text-[#444746] dark:text-slate-300">${text || '正在提取与建立索引...'}</span>
         </div>
         <div class="mx-5 h-1 w-48 bg-gray-200 dark:bg-slate-700 rounded-full overflow-hidden">
           <div id="upload-progress-fill-${id}" class="h-full bg-blue-500 rounded-full transition-all duration-200" style="width: 0%"></div>
@@ -939,6 +939,112 @@ function updateUploadProgress(loadId, ratio) {
   if (fill) fill.style.width = Math.min(100, Math.round(ratio * 100)) + '%';
 }
 
+function updateUploadStatus(loadId, text) {
+  const label = document.getElementById('upload-progress-label-' + loadId);
+  if (label) label.textContent = text;
+}
+
+function formatUploadStatus(job) {
+  if (!job) return '正在处理...';
+  if (job.status === 'done') return job.message || '文档已完成解析并建立索引。';
+  if (job.status === 'error') return job.message || '文档处理失败。';
+
+  const percent = Number(job.progress_percent || 0);
+  const roundedPercent = Number.isFinite(percent)
+    ? Math.max(0, Math.min(100, Math.round(percent)))
+    : 0;
+  return `${job.message || '正在处理...'} (${roundedPercent}%)`;
+}
+
+async function fetchUploadJobSnapshot(taskId) {
+  const res = await fetch(`/api/rag/jobs/${encodeURIComponent(taskId)}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || '获取上传任务状态失败');
+  }
+  return data.job;
+}
+
+function waitForUploadCompletion(taskId, loadId) {
+  return new Promise((resolve, reject) => {
+    const poll = async () => {
+      try {
+        const job = await fetchUploadJobSnapshot(taskId);
+        updateUploadProgress(loadId, Number(job.progress_percent || 0) / 100);
+        updateUploadStatus(loadId, formatUploadStatus(job));
+
+        if (job.status === 'done') {
+          resolve(job);
+          return;
+        }
+        if (job.status === 'error') {
+          reject(new Error(job.error || job.message || '文档处理失败'));
+          return;
+        }
+        setTimeout(poll, 1000);
+      } catch (err) {
+        reject(err);
+      }
+    };
+
+    poll();
+  });
+}
+
+function subscribeToUploadJob(taskId, loadId) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const source = new EventSource(`/api/rag/jobs/${encodeURIComponent(taskId)}/events`);
+
+    const finalizeResolve = (job) => {
+      if (settled) return;
+      settled = true;
+      source.close();
+      resolve(job);
+    };
+
+    const finalizeReject = (error) => {
+      if (settled) return;
+      settled = true;
+      source.close();
+      reject(error);
+    };
+
+    source.onmessage = (event) => {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      const job = payload?.data;
+      if (!job) return;
+
+      updateUploadProgress(loadId, Number(job.progress_percent || 0) / 100);
+      updateUploadStatus(loadId, formatUploadStatus(job));
+
+      if (payload.type === 'done' || job.status === 'done') {
+        finalizeResolve(job);
+        return;
+      }
+
+      if (payload.type === 'error' || job.status === 'error') {
+        finalizeReject(new Error(job.error || job.message || '文档处理失败'));
+      }
+    };
+
+    source.onerror = () => {
+      source.close();
+      if (settled) return;
+
+      waitForUploadCompletion(taskId, loadId)
+        .then((job) => finalizeResolve(job))
+        .catch((err) => finalizeReject(err));
+    };
+  });
+}
+
 async function handleUpload(file) {
   if (!file || isUploading) return;
   isUploading = true;
@@ -953,7 +1059,7 @@ async function handleUpload(file) {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/rag/upload');
       xhr.upload.addEventListener('progress', (e) => {
-        if (e.lengthComputable) updateUploadProgress(loadId, e.loaded / e.total);
+        if (e.lengthComputable) updateUploadProgress(loadId, (e.loaded / e.total) * 0.12);
       });
       xhr.addEventListener('load', () => {
         try { resolve({ status: xhr.status, body: JSON.parse(xhr.responseText) }); }
@@ -963,24 +1069,42 @@ async function handleUpload(file) {
       xhr.send(formData);
     });
 
-    // Snap progress to 100% before removing the loader
-    updateUploadProgress(loadId, 1);
+    if (data.status === 200 && data.body?.task_id) {
+      const acceptedJob = {
+        ...(data.body.job || {}),
+        progress_percent: Math.max(15, Number(data.body.job?.progress_percent || 0)),
+        message: data.body.job?.message || '文件已上传，等待开始处理...',
+      };
+      updateUploadProgress(loadId, Number(acceptedJob.progress_percent || 0) / 100);
+      updateUploadStatus(loadId, formatUploadStatus(acceptedJob));
 
-    removeLoading(loadId);
-    if (data.status === 200) {
-      uploadedDocs.push(data.body);
+      const finalJob = await subscribeToUploadJob(data.body.task_id, loadId);
+      const completedDocument = finalJob.result || {
+        status: 'success',
+        document_id: finalJob.document_id || data.body.document_id,
+        document_name: finalJob.filename || data.body.document_name || file.name,
+        page_count: finalJob.page_count || 0,
+        timing: finalJob.timing || {},
+      };
+
+      updateUploadProgress(loadId, 1);
+      updateUploadStatus(loadId, formatUploadStatus({ status: 'done', message: '文档已完成解析并建立索引。' }));
+      removeLoading(loadId);
+
+      uploadedDocs = uploadedDocs.filter((doc) => doc.document_id !== completedDocument.document_id);
+      uploadedDocs.push(completedDocument);
       if(typeof updateInputState === 'function') updateInputState(uploadedDocs.length);
       renderScopeBar();
       // 若"已加载文档"弹窗此时处于打开状态，自动刷新列表无需用户手动关闭重开
       const _fm = document.getElementById('filesModal');
       if (_fm && !_fm.classList.contains('hidden')) openFilesModal();
-      fetchSuggestedQuestions(data.body);
+      fetchSuggestedQuestions(completedDocument);
     } else {
       addAssistantMessage(`❌ 上传失败: ${data.body.detail}`);
     }
   } catch (err) {
     removeLoading(loadId);
-    addAssistantMessage(`❌ 网络错误，上传失败。`);
+    addAssistantMessage(`❌ 上传失败: ${err.message || '网络错误'}`);
   } finally {
     isUploading = false;
     bottomFileInput.value = "";

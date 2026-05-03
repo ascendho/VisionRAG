@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from backend.api.routes.health import router as health_router
+from backend.upload_jobs import UploadJobManager
 
 # 这个全局实例要在 lifespan 里初始化，之后在各个路由中导入
 vector_store_instance = None
+upload_job_manager = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -13,9 +15,11 @@ async def lifespan(app: FastAPI):
     from src.vector_store import VisionVectorStore
 
     # 启动时只做模型与向量库初始化，不主动清空业务数据，避免 --reload 模式下频繁重启导致数据丢失。
-    global vector_store_instance
+    global vector_store_instance, upload_job_manager
     if vector_store_instance is None:
         vector_store_instance = VisionVectorStore()
+    if upload_job_manager is None:
+        upload_job_manager = UploadJobManager()
 
     print("✅ [Startup] 服务已准备就绪。")
     yield
