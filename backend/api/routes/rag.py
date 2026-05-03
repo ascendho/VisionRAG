@@ -1318,6 +1318,7 @@ async def chat(request: Request, req: ChatRequest):
         })
         frontend_evidences.append({
             "evidence_id": evidence_id,
+            "document_id": r.get("document_id", ""),
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
@@ -1344,6 +1345,7 @@ async def chat(request: Request, req: ChatRequest):
             unused_reason = f"低于阈值 {req.min_score:.2f} 未采用" if score < req.min_score else "未进入最终正式依据"
         all_candidates_fe.append({
             "evidence_id": evidence_id_map.get(key),
+            "document_id": r.get("document_id", ""),
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": score,

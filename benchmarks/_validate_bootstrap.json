@@ -1,0 +1,74 @@
+{
+  "version": "1.0",
+  "description": "自动起草的小规模视觉 RAG benchmark 草稿，请在跑分前复核问题、答案与页码。",
+  "defaults": {
+    "top_k": 5,
+    "min_score": 0.6,
+    "chat_history": []
+  },
+  "metadata": {
+    "generated_at": "2026-05-03T22:33:46",
+    "requested_generation_mode": "heuristic",
+    "documents": [
+      {
+        "document_name": "MemGPT.pdf",
+        "document_id": "16e65f7cc5c1d647eb6acffdf085ce62",
+        "indexed_in_backend": null
+      }
+    ]
+  },
+  "items": [
+    {
+      "id": "auto-001",
+      "question": "MemGPT.pdf 第 2 页的标题或主题是什么？",
+      "question_type": "title_lookup",
+      "document_ids": [
+        "16e65f7cc5c1d647eb6acffdf085ce62"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "16e65f7cc5c1d647eb6acffdf085ce62",
+          "document_name": "MemGPT.pdf",
+          "page_number": 2
+        }
+      ],
+      "gold_answer": "MemGPT: Towards LLMs as Operating Systems",
+      "gold_answer_keywords": [
+        "MemGPT",
+        "Towards",
+        "LLMs",
+        "Operating",
+        "Systems"
+      ],
+      "notes": "自动起草草稿，请复核答案是否可由单页直接得出。来源模式：heuristic。",
+      "source_excerpt": "MemGPT: Towards LLMs as Operating Systems working_context.re “Boyfriend named “Ex-boyfriend na ) Sorry to hear that - ho How’s James doing? A working_context.append(“Birthday is February 7”) Oh wow, happy birthday!",
+      "generation_mode": "heuristic"
+    },
+    {
+      "id": "auto-002",
+      "question": "MemGPT.pdf 第 4 页的标题或主题是什么？",
+      "question_type": "title_lookup",
+      "document_ids": [
+        "16e65f7cc5c1d647eb6acffdf085ce62"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "16e65f7cc5c1d647eb6acffdf085ce62",
+          "document_name": "MemGPT.pdf",
+          "page_number": 4
+        }
+      ],
+      "gold_answer": "MemGPT: Towards LLMs as Operating Systems",
+      "gold_answer_keywords": [
+        "MemGPT",
+        "Towards",
+        "LLMs",
+        "Operating",
+        "Systems"
+      ],
+      "notes": "自动起草草稿，请复核答案是否可由单页直接得出。来源模式：heuristic。",
+      "source_excerpt": "MemGPT: Towards LLMs as Operating Systems Table 1. Comparing context lengths of commonly used models and LLM APIs (data collected 1/2024). *Approximate message count assuming a preprompt of 1k tokens, and an averag",
+      "generation_mode": "heuristic"
+    }
+  ]
+}

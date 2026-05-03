@@ -24,6 +24,12 @@ os.environ["HF_ENDPOINT"] = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
 # Qdrant 是本项目的向量数据库，用来保存每一页文档的多向量表示并执行检索。
 # 默认指向本地 Docker 容器暴露的 6333 端口。
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+# 在本地开发环境里，如果 Docker 版 Qdrant 不可用，就回退到仓库自带的持久化目录。
+QDRANT_PATH = os.getenv(
+	"QDRANT_PATH",
+	os.path.join(os.path.dirname(os.path.dirname(__file__)), "qdrant_local")
+)
+os.makedirs(QDRANT_PATH, exist_ok=True)
 
 # Doubao 是最终负责“看证据页并组织答案”的多模态大模型。
 # 这里保留 API Key 和模型名两个最核心的外部调用参数。

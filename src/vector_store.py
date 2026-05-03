@@ -32,6 +32,7 @@ from PIL import Image
 from src.config import (
     COLLECTION_NAME,
     COLPALI_MODEL_NAME,
+    QDRANT_PATH,
     QDRANT_URL,
 )
 
@@ -54,7 +55,7 @@ class VisionVectorStore:
     def __init__(self):
         # 连接本地 Qdrant。`check_compatibility=False` 是为了忽略次版本差异带来的提示，
         # 避免开发环境中客户端与服务端小版本不完全一致时频繁报警。
-        self.qdrant = QdrantClient(url=QDRANT_URL, check_compatibility=False)
+        self.qdrant = self._build_qdrant_client()
         
         # MUVERA 负责把 ColPali 的原始多向量压缩成更短的表示，主要服务第一阶段粗召回。
         # 可以把它理解成“牺牲一点点精度，换取更快的大范围候选筛选”。
@@ -84,6 +85,23 @@ class VisionVectorStore:
         
         # 启动时确保业务集合存在，这样上传与查询可以直接复用同一套结构定义。
         self._ensure_collection_exists()
+
+    def _build_qdrant_client(self) -> QdrantClient:
+        if QDRANT_URL:
+            try:
+                client = QdrantClient(url=QDRANT_URL, check_compatibility=False)
+                client.get_collections()
+                return client
+            except Exception as exc:
+                logger.warning(
+                    "Failed to connect to remote Qdrant at %s, falling back to local path %s: %s",
+                    QDRANT_URL,
+                    QDRANT_PATH,
+                    exc,
+                )
+
+        logger.info("Using embedded Qdrant storage at %s", QDRANT_PATH)
+        return QdrantClient(path=QDRANT_PATH)
 
     def _ensure_collection_exists(self):
         """

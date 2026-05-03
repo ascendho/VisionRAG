@@ -167,3 +167,45 @@ python -m uvicorn backend.main:app --reload --port 8000
 | `GET` | `/api/rag/files/{id}/download` | 下载原始文件 |
 | `DELETE` | `/api/rag/files/{id}` | 删除文档及其索引 |
 | `GET` | `/api/health` | 服务健康检查 |
+
+## 📊 RAG 评测实验
+
+仓库里已经提供了一版基于真实 `/api/rag/chat` 接口的离线评测 harness，可直接用来跑小规模 benchmark、统计检索指标，并导出人工复核表。
+
+推荐工作流：
+
+1. 第一轮先收敛到 2 到 3 份真实 PDF / PPTX 文档、10 道题，并确认后端已经完成索引。
+2. 如果不想从零手工写题，可以先运行自动起草脚本，批量生成一个待复核 benchmark 草稿：
+
+```bash
+python scripts/bootstrap_rag_benchmark.py \
+    --documents waLLMartCache.pdf MemGPT.pdf \
+    --target-question-count 10 \
+    --output-file benchmarks/rag_eval_small_draft.json
+```
+
+3. 再参考 [benchmarks/README.md](benchmarks/README.md) 和 [benchmarks/rag_eval_template.json](benchmarks/rag_eval_template.json) 做最后复核。
+4. 启动后端服务后运行：
+
+```bash
+python scripts/run_rag_eval.py \
+    --benchmark-file benchmarks/rag_eval_small_draft.json \
+    --api-base-url http://127.0.0.1:8000 \
+    --output-dir eval_runs/first_pass
+```
+
+脚本会输出：
+
+- `summary.json`：自动汇总的 retrieval / latency / citation 指标
+- `detailed_results.json`：逐题原始结果，适合排查失败样例
+- `review_sheet.csv`：带空白人工评分列的复核表，可继续补 `manual_answer_accuracy`、`manual_faithfulness`、`manual_citation_correctness`
+
+如果你已经手工补完 `review_sheet.csv`，可以单独做一次人工评分汇总：
+
+```bash
+python scripts/run_rag_eval.py --review-csv eval_runs/first_pass/review_sheet.csv
+```
+
+`bootstrap_rag_benchmark.py` 会优先尝试基于单页文本自动生成“问题 + gold answer + gold page”的草稿；如果当前环境没有可用的大模型 key，也会退回到启发式模式，至少先帮你把文档页码、标题/重点句和 review CSV 搭起来，避免全量手工抄题。
+
+第一版会自动统计：raw/final page Hit@1、Hit@3、MRR、doc Hit@K、fallback 使用率、unsupported sub-query 数、retrieval latency、首 token 延迟、keyword coverage、citation 是否命中 gold evidence。对于更可信的答案质量结论，仍建议结合人工评分结果一起使用。

@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "description": "适用于 10 题、2 到 3 份文档起步的小规模视觉 RAG benchmark 模板。",
+  "defaults": {
+    "top_k": 5,
+    "min_score": 0.6,
+    "chat_history": []
+  },
+  "items": [
+    {
+      "id": "replace-me-001",
+      "question": "根据这一页内容，文中提到的关键数值是多少？",
+      "question_type": "numeric_fact",
+      "document_ids": [],
+      "gold_evidence": [
+        {
+          "document_id": "",
+          "document_name": "replace-with-your-document-name.pdf",
+          "page_number": 1
+        }
+      ],
+      "gold_answer": "请替换成标准答案，例如某个具体数字或年份。",
+      "gold_answer_keywords": [
+        "关键词-1",
+        "关键词-2"
+      ],
+      "notes": "把这个示例替换成你自己文档里的真实问题。优先选择单页可答、页码明确、答案较短的问题。"
+    },
+    {
+      "id": "replace-me-002",
+      "question": "这一页主要说明了什么限制或结论？",
+      "question_type": "definition_summary",
+      "document_ids": [],
+      "gold_evidence": [
+        {
+          "document_id": "",
+          "document_name": "replace-with-your-document-name.pdf",
+          "page_number": 3
+        }
+      ],
+      "gold_answer": "请替换成一句话标准答案。",
+      "gold_answer_keywords": [
+        "关键词-1",
+        "关键词-2"
+      ],
+      "notes": "答案尽量控制在一句话或几个短语内，让复核者能在几秒内判断正误。"
+    }
+  ]
+}
