@@ -11,7 +11,13 @@ import tempfile
 import glob
 import time
 
-from src.doc_processor import process_pdf_to_images, process_image_to_images, process_text_to_images, get_file_hash
+from src.doc_processor import (
+    get_file_hash,
+    process_image_to_images,
+    process_pdf_to_images,
+    process_pptx_to_images,
+    process_text_to_images,
+)
 from src.llm_generator import generate_answer_stream, generate_suggested_questions
 from src.config import DEFAULT_MIN_SCORE, QUERY_GUARD_ENABLED
 from src.query_rewriter import rewrite_query_with_context
@@ -136,6 +142,8 @@ def _select_results_with_threshold_fallback(
             cloned = dict(item)
             cloned["fallback_below_threshold"] = False
             cloned["fallback_source_score"] = float(cloned.get("score", 0.0))
+            cloned["fallback_gap_to_threshold"] = 0.0
+            cloned["fallback_tier"] = "formal"
             cloned["fallback_reason"] = ""
             prepared_results.append(cloned)
         return {
@@ -157,8 +165,11 @@ def _select_results_with_threshold_fallback(
     for item in results[:max(1, int(fallback_limit))]:
         cloned = dict(item)
         source_score = float(cloned.get("score", 0.0))
+        fallback_gap = round(max(float(min_score) - source_score, 0.0), 2)
         cloned["fallback_below_threshold"] = True
         cloned["fallback_source_score"] = source_score
+        cloned["fallback_gap_to_threshold"] = fallback_gap
+        cloned["fallback_tier"] = "near_threshold" if fallback_gap <= 0.05 else "low_confidence"
         cloned["fallback_reason"] = f"best_available_below_threshold<{min_score:.2f}"
         promoted_results.append(cloned)
 
@@ -349,10 +360,6 @@ def _apply_reusable_sub_query_support(
     min_score: float,
 ) -> Dict[str, Any]:
     reuse_min_score = float(min_score)
-    if reuse_min_score > 0.45:
-        # 这里的复核只在“已经正式入选的 evidence 页”上做，
-        # 不再面对全库误召回问题，所以阈值可以比直接检索略放宽一点。
-        reuse_min_score = max(0.45, reuse_min_score - 0.15)
 
     prepared_results: List[Dict[str, Any]] = []
     result_lookup: Dict[tuple, Dict[str, Any]] = {}
@@ -659,7 +666,7 @@ def _build_confidence_summary(results: List[dict]) -> dict:
 def _rebuild_image_cache_if_needed(results: list) -> None:
     """
     检查检索结果中的图像缓存文件是否存在（系统重启后 /tmp 会被清空）。
-    若缺失，则从 qdrant_local/pdfs/ 中找到对应 PDF 并重新渲染图像缓存。
+    若缺失，则从持久化原件目录中找到对应文件并重新渲染图像缓存。
     """
     missing_doc_ids: dict = {}
     for r in results:
@@ -672,9 +679,10 @@ def _rebuild_image_cache_if_needed(results: list) -> None:
     if not missing_doc_ids:
         return
 
-    pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+    # 目录名继续沿用 pdfs 以兼容已有持久化数据，实际存放的是所有原始上传文件。
+    stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
     for doc_id, doc_name in missing_doc_ids.items():
-        matches = glob.glob(os.path.join(pdfs_dir, f"{doc_id}_*"))
+        matches = glob.glob(os.path.join(stored_files_dir, f"{doc_id}_*"))
         file_path = matches[0] if matches else None
         if not file_path or not os.path.exists(file_path):
             print(f"[Warning] File not found for document '{doc_name}' ({doc_id}), cannot rebuild image cache.")
@@ -684,6 +692,8 @@ def _rebuild_image_cache_if_needed(results: list) -> None:
             ext = os.path.splitext(file_path)[1].lower()
             if ext == ".pdf":
                 process_pdf_to_images(file_path)
+            elif ext == ".pptx":
+                process_pptx_to_images(file_path)
             elif ext in {".txt", ".md"}:
                 process_text_to_images(file_path)
             else:
@@ -693,12 +703,12 @@ def _rebuild_image_cache_if_needed(results: list) -> None:
 
 
 @router.get("/files/{document_id}/download")
-def download_pdf(document_id: str):
+def download_file(document_id: str):
     """
-    Download the original file (PDF or image).
+    Download the original uploaded file.
     """
-    pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-    matches = glob.glob(os.path.join(pdfs_dir, f"{document_id}_*"))
+    stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+    matches = glob.glob(os.path.join(stored_files_dir, f"{document_id}_*"))
     
     file_path = matches[0] if matches else None
         
@@ -707,8 +717,14 @@ def download_pdf(document_id: str):
         
     filename = os.path.basename(file_path)
     ext = os.path.splitext(filename)[1].lower()
-    mime_map = {".pdf": "application/pdf", ".png": "image/png",
-                ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+    mime_map = {
+        ".pdf": "application/pdf",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
     mime = mime_map.get(ext, "application/octet-stream")
     
     return FileResponse(
@@ -745,25 +761,25 @@ def delete_file(document_id: str):
     try:
         vector_store_instance.delete_document(document_id)
         
-        pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-        for m in glob.glob(os.path.join(pdfs_dir, f"{document_id}_*")):
+        stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+        for m in glob.glob(os.path.join(stored_files_dir, f"{document_id}_*")):
             os.remove(m)
             
         return {"status": "success", "message": f"Document {document_id} deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".txt", ".md"}
+ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".pptx"}
 
 @router.post("/upload")
 def upload_file(file: UploadFile = File(...)):
     """
-    接收 PDF 或图片文件，处理为页面缓存与向量特征。
-    支持格式：PDF / PNG / JPG / JPEG / WEBP
+    接收视觉文档文件，处理为页面缓存与向量特征。
+    支持格式：PDF / PNG / JPG / JPEG / WEBP / PPTX
     """
     suffix = os.path.splitext(file.filename)[1].lower() if file.filename else ""
     if suffix not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="请上传支持的文件格式（PDF / PNG / JPG / WEBP / TXT / MD）")
+        raise HTTPException(status_code=400, detail="请上传支持的文件格式（PDF / PNG / JPG / WEBP / PPTX）")
     tmp = tempfile.NamedTemporaryFile(prefix="rag_upload_", suffix=suffix, delete=False)
     temp_path = tmp.name
     tmp.close()
@@ -776,8 +792,8 @@ def upload_file(file: UploadFile = File(...)):
         image_render_start = time.perf_counter()
         if suffix == ".pdf":
             image_paths = process_pdf_to_images(temp_path)
-        elif suffix in {".txt", ".md"}:
-            image_paths = process_text_to_images(temp_path)
+        elif suffix == ".pptx":
+            image_paths = process_pptx_to_images(temp_path)
         else:
             image_paths = process_image_to_images(temp_path)
         document_render_ms = (time.perf_counter() - image_render_start) * 1000
@@ -788,11 +804,11 @@ def upload_file(file: UploadFile = File(...)):
         file_hash = get_file_hash(temp_path)
         safe_filename = file.filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
         
-        # 保存持久化 PDF
-        pdfs_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-        os.makedirs(pdfs_dir, exist_ok=True)
-        final_pdf_path = os.path.join(pdfs_dir, f"{file_hash}_{safe_filename}")
-        shutil.copy(temp_path, final_pdf_path)
+        # 保存原始上传文件，目录名继续沿用 pdfs 以兼容已有数据。
+        stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
+        os.makedirs(stored_files_dir, exist_ok=True)
+        final_file_path = os.path.join(stored_files_dir, f"{file_hash}_{safe_filename}")
+        shutil.copy(temp_path, final_file_path)
         
         # 避免并发时引错库，延迟导入或从全局拿， 这里我们可以从全局获取 vector_store_instance，或者重新调单例
         # 为简单起见，从 main 导入全局实例
@@ -1035,6 +1051,8 @@ async def chat(request: Request, req: ChatRequest):
             "score": float(r.get("score", 0.0)),
             "fallback_below_threshold": bool(r.get("fallback_below_threshold")),
             "fallback_source_score": float(r.get("fallback_source_score", r.get("score", 0.0))),
+            "fallback_gap_to_threshold": float(r.get("fallback_gap_to_threshold", 0.0)),
+            "fallback_tier": str(r.get("fallback_tier") or "formal"),
             "fallback_reason": str(r.get("fallback_reason") or ""),
             "matched_sub_queries": direct_supported_sub_queries,
             "direct_supported_sub_queries": direct_supported_sub_queries,
@@ -1048,6 +1066,8 @@ async def chat(request: Request, req: ChatRequest):
             "score": float(r.get("score", 0.0)),
             "fallback_below_threshold": bool(r.get("fallback_below_threshold")),
             "fallback_source_score": float(r.get("fallback_source_score", r.get("score", 0.0))),
+            "fallback_gap_to_threshold": float(r.get("fallback_gap_to_threshold", 0.0)),
+            "fallback_tier": str(r.get("fallback_tier") or "formal"),
             "fallback_reason": str(r.get("fallback_reason") or ""),
             "image_base64": image_path_to_base64(image_path),
             "matched_sub_queries": direct_supported_sub_queries,

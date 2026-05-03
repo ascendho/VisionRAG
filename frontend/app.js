@@ -399,14 +399,61 @@ function flushStreamRender(options = {}) {
   renderStreamingAnswer(activeChat.msgId, activeChat.answerText, options);
 }
 
+async function copyTextToClipboard(text) {
+  if (!text) return false;
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (err) {
+      console.warn('navigator.clipboard.writeText failed, falling back to execCommand', err);
+    }
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'readonly');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  try {
+    return document.execCommand('copy');
+  } catch (err) {
+    console.error(err);
+    return false;
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
 async function copyAssistantMessage(msgId, button) {
   const text = assistantMessageCache.get(msgId) || '';
   if (!text) return;
 
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (err) {
-    console.error(err);
+  const copied = await copyTextToClipboard(text);
+  if (!copied) {
+    return;
+  }
+
+  const icon = button?.querySelector('svg');
+  if (!icon) return;
+  const previousIcon = icon.innerHTML;
+  icon.innerHTML = '<polyline points="20 6 9 17 4 12"></polyline>';
+  setTimeout(() => {
+    icon.innerHTML = previousIcon;
+  }, 1500);
+}
+
+async function copyUserMessage(text, button) {
+  if (!text) return;
+
+  const copied = await copyTextToClipboard(text);
+  if (!copied) {
     return;
   }
 
@@ -646,6 +693,17 @@ function getFileIcon(filename) {
         <path d="M13 15.5v-5h1a2 2 0 0 1 0 4h-1"></path>
         <path d="M17 15.5v-5h2"></path>
         <path d="M17 13h1.5"></path>
+      </svg>
+    </div>`;
+  } else if (ext === 'pptx') {
+    return `<div class="w-12 h-12 rounded-2xl bg-orange-50 dark:bg-orange-900/20 flex flex-col items-center justify-center shrink-0 border border-orange-100 dark:border-orange-900/50 text-orange-500">
+      <svg class="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+        <polyline points="14 2 14 8 20 8"></polyline>
+        <path d="M8.5 16.5v-5H11a1.5 1.5 0 0 1 0 3H8.5"></path>
+        <path d="M14.5 11.5h2"></path>
+        <path d="M15.5 11.5v5"></path>
+        <path d="M13.5 16.5h4"></path>
       </svg>
     </div>`;
   } else if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
@@ -1161,7 +1219,7 @@ function addUserMessage(text) {
         </div>
         <!-- Action Bar: Visible only on hover -->
         <div class="flex gap-2 mr-2 opacity-0 group-hover:opacity-100 transition-opacity items-center">
-          <button onclick="navigator.clipboard.writeText('${escapedText}')" class="p-1.5 text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors" title="复制">
+          <button onclick="copyUserMessage('${escapedText}', this)" class="p-1.5 text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors" title="复制">
             <svg class="w-[15px] h-[15px]" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
           </button>
           <button onclick="const i = document.getElementById('queryInput'); i.value = '${escapedText}'; i.focus();" class="p-1.5 text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-800 rounded-full transition-colors" title="重新编辑">
@@ -1354,7 +1412,7 @@ function updateInputState(count) {
   if (count === 0) {
     txt.classList.remove('w-0', 'opacity-0', 'ml-0');
     txt.classList.add('w-[60px]', 'opacity-100', 'ml-1.5');
-    input.placeholder = "💡 请先点击左侧上传 PDF、图片或文本文档...";
+    input.placeholder = "💡 请先点击左侧上传 PDF、图片或 PPTX 文档...";
   } else {
     txt.classList.remove('w-[60px]', 'opacity-100', 'ml-1.5');
     txt.classList.add('w-0', 'opacity-0', 'ml-0');

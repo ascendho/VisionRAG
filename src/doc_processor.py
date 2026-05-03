@@ -1,21 +1,19 @@
 """文档预处理模块。
 
-这个模块负责把用户上传的不同类型文件统一整理成“页面图像列表”，供后续
-ColPali 视觉检索模型使用。之所以整个项目坚持把输入统一成图片，而不是把
-PDF/Markdown 直接抽成纯文本，是因为本项目的检索模型天然以视觉页面为输入，
-它能够同时保留排版、表格、图表、公式、标题层级等纯文本切片容易丢失的信息。
-
-可以把这里理解成 RAG 流程的“输入标准化层”：
-1. PDF 被拆成逐页图片。
-2. 单张图片被当成单页文档。
-3. 文本文件先被排版成若干图片页。
+这个模块负责把用户上传的视觉文档统一整理成“页面图像列表”，供后续
+ColPali 视觉检索模型使用。项目当前主打的输入类型是：
+1. PDF：直接拆成逐页图片。
+2. 单张图片：作为单页文档进入索引。
+3. PPTX：先转成 PDF，再复用 PDF 转页图链路。
 
 后面的向量化、检索、生成都默认依赖这种统一的页面图表示。
 """
 
+import hashlib
 import os
 import shutil
-import hashlib
+import subprocess
+import tempfile
 import textwrap
 from typing import List
 from PIL import Image, ImageDraw, ImageFont
@@ -103,7 +101,20 @@ def get_file_hash(file_path: str) -> str:
     return hasher.hexdigest()
 
 
-def process_pdf_to_images(pdf_path: str, dpi: int = 150) -> List[str]:
+def _find_soffice_binary() -> str | None:
+    """定位可用的 LibreOffice/soffice 可执行文件。"""
+    candidates = [
+        shutil.which("soffice"),
+        shutil.which("libreoffice"),
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def process_pdf_to_images(pdf_path: str, dpi: int = 150, cache_key: str | None = None) -> List[str]:
     """
     将 PDF 文件的每一页分别转为高质量 PNG 截图并保存到缓存目录。
     这是整个 Vision RAG 流程最关键的输入转换步骤之一。
@@ -126,7 +137,7 @@ def process_pdf_to_images(pdf_path: str, dpi: int = 150) -> List[str]:
     返回:
         List[str]: 所有页面对应的图片保存路径列表。
     """
-    file_hash = get_file_hash(pdf_path)
+    file_hash = cache_key or get_file_hash(pdf_path)
     # 每个文件使用独立缓存目录，避免不同文档之间的页面图相互覆盖。
     doc_cache_dir = os.path.join(IMAGE_CACHE_DIR, file_hash)
     os.makedirs(doc_cache_dir, exist_ok=True)
@@ -151,6 +162,39 @@ def process_pdf_to_images(pdf_path: str, dpi: int = 150) -> List[str]:
         image_paths.append(image_path)
         
     return image_paths
+
+
+def process_pptx_to_images(pptx_path: str, dpi: int = 150) -> List[str]:
+    """将 PPTX 先转成 PDF，再复用现有 PDF 渲染链路生成页面图。"""
+    soffice_binary = _find_soffice_binary()
+    if not soffice_binary:
+        raise RuntimeError(
+            "未检测到 LibreOffice/soffice，无法处理 PPTX。"
+            "请先安装 LibreOffice，并确保 `soffice` 可执行文件可用。"
+        )
+
+    cache_key = get_file_hash(pptx_path)
+    with tempfile.TemporaryDirectory(prefix="rag_pptx_convert_") as output_dir:
+        convert_cmd = [
+            soffice_binary,
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            output_dir,
+            pptx_path,
+        ]
+        result = subprocess.run(convert_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            error_message = (result.stderr or result.stdout or "未知错误").strip()
+            raise RuntimeError(f"PPTX 转 PDF 失败：{error_message}")
+
+        pdf_name = f"{os.path.splitext(os.path.basename(pptx_path))[0]}.pdf"
+        converted_pdf_path = os.path.join(output_dir, pdf_name)
+        if not os.path.exists(converted_pdf_path):
+            raise RuntimeError("PPTX 转 PDF 失败：未找到转换后的 PDF 文件")
+
+        return process_pdf_to_images(converted_pdf_path, dpi=dpi, cache_key=cache_key)
 
 
 def process_image_to_images(image_path: str) -> List[str]:
@@ -183,6 +227,9 @@ def process_image_to_images(image_path: str) -> List[str]:
 def process_text_to_images(text_path: str) -> List[str]:
     """
     将纯文本文件（.txt / .md）渲染为图像页面，使其可被 ColPali 建立视觉索引。
+
+    这个函数目前主要保留给历史数据兼容或离线实验使用；默认上传入口已不再
+    暴露 TXT / MD。
 
     这一点很重要：虽然输入是文本，但检索模型不是传统文本 embedding 模型，
     而是“看页面截图”的视觉模型。所以文本文件不能直接跳过图像化步骤，

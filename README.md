@@ -1,12 +1,12 @@
 # VisionDoc
 
-![image-20260501000918314](assets/image-20260501000918314.png)基于 **ColPali + MUVERA + Qdrant** 的多格式视觉文档问答系统。上传 PDF、图片或纯文本文件，系统将每页渲染为图像后用 ColPali 建立视觉索引，查询时两阶段检索召回最相关页面，再由豆包视觉大模型生成答案，并附上原页截图供溯源。
+![image-20260501000918314](assets/image-20260501000918314.png)基于 **ColPali + MUVERA + Qdrant** 的视觉文档问答系统。上传 PDF、图片或 PPTX 文件，系统将每页统一渲染为图像后用 ColPali 建立视觉索引，查询时两阶段检索召回最相关页面，再由豆包视觉大模型生成答案，并附上原页截图供溯源。
 
 ## 🌟 核心特性
 
-- **多格式文件支持**：PDF / PNG / JPG / JPEG / WEBP / TXT / MD，统一渲染为页面图像进入索引
+- **视觉文档支持**：PDF / PNG / JPG / JPEG / WEBP / PPTX，统一渲染为页面图像进入索引
 - **两阶段检索**：MUVERA 压缩向量快速海选（Prefetch）+ ColPali 原始多向量 MaxSim 精准重排（Rerank）
-- **归一化相关性得分**：MaxSim 原始分除以查询 token 数，得分落在 0–1 区间，阈值稳定不受查询长度影响
+- **归一化相关性得分**：MaxSim 原始分除以查询 token 数，得分落在 0–1 区间；默认采用阈值按 `score >= 0.60` 判断，阈值稳定不受查询长度影响
 - **复合问题支持**：对以强分隔符拆出的多个子问题分别检索，再合并证据页，减少多问合并时只覆盖单一主题的问题
 - **多文档作用域查询**：Scope Bar 支持同时选中多个文档进行对话，也可切回全库检索
 - **原页图片溯源**：每条回答附带匹配页面缩略图网格（最多 5 列自适应），点击大图查看；卡片显示文档名、页码与相关性得分
@@ -23,7 +23,8 @@
 | 后端框架 | FastAPI + uvicorn |
 | 前端 | 原生 HTML/JS + Tailwind CSS CDN + marked.js |
 | PDF 解析 | pdf2image + Poppler |
-| 图像处理 | Pillow（图片缓存、文本渲染）|
+| 文档转图 | pdf2image + Poppler；PPTX 通过 LibreOffice `soffice` 先转 PDF |
+| 图像处理 | Pillow（图片缓存与标准化）|
 
 ## 📂 项目结构
 
@@ -33,7 +34,7 @@ RAG/
 ├── src/                           # AI 核心逻辑
 │   ├── config.py                  # 环境变量（API Key、模型名、Qdrant URL 等）
 │   ├── llm_generator.py           # 调用豆包视觉 LLM 生成答案
-│   ├── doc_processor.py            # 多格式文档 → 页面图像缓存（PDF/图片/文本）
+│   ├── doc_processor.py            # 视觉文档 → 页面图像缓存（PDF/图片/PPTX）
 │   └── vector_store.py            # ColPali + MUVERA + Qdrant 封装
 ├── backend/                       # FastAPI 后端
 │   ├── main.py                    # 应用入口，挂载静态前端
@@ -55,10 +56,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> macOS 需要安装 Poppler（PDF 解析依赖）：
+> macOS 需要安装 Poppler 和 LibreOffice：
 > ```bash
 > brew install poppler
+> brew install --cask libreoffice
 > ```
+>
+> PPTX 支持依赖 LibreOffice 提供的 `soffice` 转换能力；如果本机没有该命令，上传 PPTX 会直接返回可操作的错误提示。
 
 ### 2. 配置环境变量
 
@@ -89,7 +93,7 @@ python -m uvicorn backend.main:app --reload --port 8000
 
 ## 📖 使用说明
 
-1. **上传文件**：点击左侧上传按钮，支持 PDF、PNG、JPG、WEBP、TXT、MD 格式
+1. **上传文件**：点击左侧上传按钮，支持 PDF、PNG、JPG、WEBP、PPTX 格式
 2. **多文档管理**：点击右上角文件图标查看已加载文档，可下载原文件或删除
 3. **作用域选择**：上传 2 个及以上文档后，输入框上方出现 Scope Bar，可点击选中特定文档进行对话
 4. **提问**：在输入框输入问题，回车或点击发送；回答下方附有相关页面截图，点击可全屏查看
@@ -98,8 +102,9 @@ python -m uvicorn backend.main:app --reload --port 8000
 
 ### 1. 上传与建索引
 
-1. 接收 PDF / 图片 / 文本文件
+1. 接收 PDF / 图片 / PPTX 文件
 2. 将文档统一转换为页面图像
+    - PPTX 会先转成 PDF，再复用现有 PDF 转页图链路
 3. 使用 ColPali 为每一页生成多向量视觉特征
 4. 使用 MUVERA 生成压缩向量，作为第一阶段快速召回特征
 5. 将原始多向量与压缩向量一起写入 Qdrant
@@ -111,8 +116,8 @@ python -m uvicorn backend.main:app --reload --port 8000
 3. 对单问题或每个子问题分别生成查询向量
 4. 使用 MUVERA 在 Qdrant 中进行第一阶段 Prefetch
 5. 用 ColPali 原始多向量执行 MaxSim 精排，得到最相关页面
-6. 若有页面达到最小相关性阈值，则直接使用这些证据页生成答案
-7. 若某个问题或子问题没有页面达到阈值，但仍检索到候选页，则硬回退到该问题或子问题得分最高的 1 页证据继续生成答案
+6. 若有页面达到最小相关性阈值（默认 `score >= 0.60`），则直接使用这些证据页生成答案
+7. 若某个问题或子问题没有页面达到阈值，但仍检索到候选页，则回退到该问题或子问题得分最高的 1 页证据继续生成答案；若页面内容已明确写出答案，可直接作答，否则会在说明层提示证据质量或写明无法确认
 8. 将最终合并后的证据页截图与证据元数据送给豆包多模态模型生成答案
 
 ## 📏 证据质量分数说明
@@ -125,7 +130,7 @@ python -m uvicorn backend.main:app --reload --port 8000
 
 当前项目是多模态视觉 RAG，慢主要来自三类成本，而不是单一组件瓶颈：
 
-1. **文档预处理**：PDF 转图、文本渲染成图，本身就有 IO 与图像处理开销
+1. **文档预处理**：PDF 转图、PPTX 转 PDF 再转图，本身就有 IO 与图像处理开销
 2. **视觉嵌入**：ColPali 要对每页图像做多向量推理，这是上传阶段最重的本地计算
 3. **最终回答生成**：检索完成后还要调用豆包多模态模型生成答案，这通常比 Qdrant 查询更慢
 

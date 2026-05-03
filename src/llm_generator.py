@@ -87,7 +87,7 @@ def _build_system_prompt() -> str:
         "8. 输出尽量使用以下结构中的适用部分：`结论`、`依据`、`不确定点`。\n"
         "9. 如果用户问题包含多个独立子问题，必须逐项回答每一项，不要只回答其中一部分。\n"
         "10. 对证据不足的子问题，要单独写明“根据当前证据无法确认”，不要让一个子问题的证据结论替代另一个子问题。\n"
-        "11. 如果某条证据被标记为低于采用阈值的回退证据，说明它是当前最相关但置信度较低的候选。你可以引用它，但必须明确使用谨慎表述，不能把它写成完全确定的事实。"
+        "11. 如果某条证据被标记为低于采用阈值的回退证据，这只表示检索分数略低于采用阈值，不等于页面内容本身不可靠。若页面中已经明确写出答案，可以直接回答并引用该证据；只有在页面不可读、信息冲突、或仍需要额外推断时，才使用谨慎措辞或写“根据当前证据无法确认”。"
     )
 
 
@@ -111,16 +111,24 @@ def _format_evidence_context(evidence_context: List[dict] | None = None) -> str:
         reused_supported_sub_queries = item.get("reused_supported_sub_queries") or []
         fallback_below_threshold = bool(item.get("fallback_below_threshold"))
         fallback_source_score = item.get("fallback_source_score")
+        fallback_gap_to_threshold = item.get("fallback_gap_to_threshold")
+        fallback_tier = str(item.get("fallback_tier") or "formal")
         if isinstance(score, (float, int)):
             line = f"[{evidence_id}] 文档：{document_name}；页码：{page_number}；相关性分数：{score:.2f}"
         else:
             line = f"[{evidence_id}] 文档：{document_name}；页码：{page_number}"
 
         if fallback_below_threshold:
-            if isinstance(fallback_source_score, (float, int)):
-                line += f"；证据状态：低置信回退（原始分数：{float(fallback_source_score):.2f}）"
+            if isinstance(fallback_source_score, (float, int)) and isinstance(fallback_gap_to_threshold, (float, int)):
+                label = "接近阈值的回退证据" if fallback_tier == "near_threshold" else "回退证据"
+                line += (
+                    f"；证据状态：{label}"
+                    f"（原始分数：{float(fallback_source_score):.2f}，距采用阈值差 {float(fallback_gap_to_threshold):.2f}）"
+                )
+            elif isinstance(fallback_source_score, (float, int)):
+                line += f"；证据状态：回退证据（原始分数：{float(fallback_source_score):.2f}）"
             else:
-                line += "；证据状态：低置信回退"
+                line += "；证据状态：回退证据"
         if direct_supported_sub_queries:
             line += f"；直接支持：{' / '.join(direct_supported_sub_queries)}"
         if reused_supported_sub_queries:
@@ -159,7 +167,7 @@ def _build_turn_sections(
         sections.append("对这些子问题必须逐项写“根据当前证据无法确认”，不要借用其他子问题的证据替代回答。")
 
     if evidence_context and any(bool(item.get("fallback_below_threshold")) for item in evidence_context):
-        sections.append("本轮包含低于采用阈值但当前最相关的回退证据。你可以参考这些证据作答，但必须明确保持谨慎措辞，不要把低置信候选写成完全确定的结论。")
+        sections.append("本轮包含低于采用阈值的回退证据。请先判断页面内容是否明确回答了问题：如果答案在页面中清晰可读，就直接给出结论并引用 [E1]/[E2]；如果页面信息模糊、需要额外推断、或只能提供弱支持，再把低分 caveat 放到说明层，并使用谨慎措辞。")
 
     evidence_text = _format_evidence_context(evidence_context)
     if evidence_text:
