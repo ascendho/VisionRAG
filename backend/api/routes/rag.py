@@ -14,6 +14,7 @@ import time
 from src.doc_processor import process_pdf_to_images, process_image_to_images, process_text_to_images, get_file_hash
 from src.llm_generator import generate_answer_stream, generate_suggested_questions
 from src.config import DEFAULT_MIN_SCORE, QUERY_GUARD_ENABLED
+from src.query_rewriter import rewrite_query_with_context
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -119,11 +120,285 @@ def _result_identity(result: Dict[str, Any]) -> tuple:
     )
 
 
-def _filter_results_with_fallback(results: List[Dict[str, Any]], min_score: float) -> List[Dict[str, Any]]:
-    filtered = [dict(item) for item in results if float(item.get("score", 0.0)) >= min_score]
-    if not filtered and results:
-        filtered = [dict(results[0])]
-    return filtered
+def _filter_results_by_min_score(results: List[Dict[str, Any]], min_score: float) -> List[Dict[str, Any]]:
+    return [dict(item) for item in results if float(item.get("score", 0.0)) >= min_score]
+
+
+def _best_result_score(results: List[Dict[str, Any]]) -> float:
+    if not results:
+        return 0.0
+    return round(max(float(item.get("score", 0.0)) for item in results), 2)
+
+
+def _build_insufficient_evidence_answer(min_score: float, sub_queries: List[str]) -> str:
+    lines = [
+        "### 结论",
+        "",
+        "根据当前证据无法确认。",
+        "",
+        "### 依据",
+        "",
+        f"当前检索到的候选页都未达到采用阈值 {min_score:.2f}，因此本轮不引用任何正式证据。",
+    ]
+
+    if sub_queries:
+        lines.extend([
+            "",
+            "本轮涉及的问题：",
+        ])
+        lines.extend([f"- {sub_query}" for sub_query in sub_queries])
+
+    lines.extend([
+        "",
+        "你可以尝试缩小问题范围、换一种更具体的问法，或临时降低阈值后再查看未采用候选页。",
+    ])
+    return "\n".join(lines)
+
+
+def _sanitize_sub_query_context_text(query: str) -> str:
+    cleaned = re.sub(r"[？?；;\n]+", " ", (query or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.rstrip("。.!！,，、:：;；")
+
+
+def _build_compound_rewrite_history(chat_history: Optional[List[dict]], prior_sub_queries: List[str]) -> List[dict]:
+    history = [
+        {"role": str(item.get("role", "")).strip(), "content": str(item.get("content", "")).strip()}
+        for item in (chat_history or [])
+        if str(item.get("role", "")).strip() in {"user", "assistant"} and str(item.get("content", "")).strip()
+    ]
+    if prior_sub_queries:
+        latest_context = _sanitize_sub_query_context_text(prior_sub_queries[-1])
+        if latest_context:
+            # 这里刻意把上一子问题压成一条简短 assistant 上下文，
+            # 让后续“那他/那它/第二个...”这类指代追问也能走已有 rewrite/fallback 逻辑。
+            history.append({"role": "assistant", "content": latest_context})
+    return history
+
+
+def _normalize_anchor_query_for_bridge(query: str) -> str:
+    cleaned = _sanitize_sub_query_context_text(query)
+    cleaned = re.sub(r"(是什么|是啥|是谁|有哪些|有什么|有没有|是否|能否|可否|会不会|如何|怎么样|多少|几种|几个|几款|吗|呢|么|是)$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.rstrip("的")
+
+
+def _build_compound_local_bridge_query(current_sub_query: str, prior_sub_queries: List[str]) -> str:
+    query_text = _sanitize_sub_query_context_text(current_sub_query)
+    if not query_text or not prior_sub_queries:
+        return current_sub_query
+
+    anchor_query = _normalize_anchor_query_for_bridge(prior_sub_queries[-1])
+    if not anchor_query:
+        return current_sub_query
+
+    referential_replacements = [
+        (r"^(那|那么)?他的", f"{anchor_query}的"),
+        (r"^(那|那么)?她的", f"{anchor_query}的"),
+        (r"^(那|那么)?它的", f"{anchor_query}的"),
+        (r"^(那|那么)?其", f"{anchor_query}的"),
+        (r"^(那|那么)?他", anchor_query),
+        (r"^(那|那么)?她", anchor_query),
+        (r"^(那|那么)?它", anchor_query),
+    ]
+
+    for pattern, replacement in referential_replacements:
+        rewritten = re.sub(pattern, replacement, query_text, count=1)
+        if rewritten != query_text:
+            rewritten = re.sub(r"\s+", " ", rewritten).strip()
+            return rewritten
+
+    return current_sub_query
+
+
+def _plan_retrieval_queries(original_query: str, chat_history: Optional[List[dict]]) -> Dict[str, Any]:
+    query_labels = _split_compound_query(original_query)
+    if len(query_labels) <= 1:
+        rewrite_meta = rewrite_query_with_context(
+            original_query=original_query,
+            chat_history=chat_history,
+        )
+        retrieval_query = str(rewrite_meta.get("rewritten_query") or original_query)
+        rewrite_meta["sub_query_rewrites"] = [
+            {
+                "original_query": original_query,
+                "retrieval_query": retrieval_query,
+                "applied": bool(rewrite_meta.get("applied")),
+                "reason": str(rewrite_meta.get("reason") or "unknown"),
+                "timing_ms": float(rewrite_meta.get("timing_ms") or 0.0),
+                "history_messages_used": int(rewrite_meta.get("history_messages_used") or 0),
+                "model": str(rewrite_meta.get("model") or ""),
+            }
+        ]
+        return {
+            "query_labels": query_labels or [original_query],
+            "retrieval_sub_queries": [retrieval_query],
+            "rewrite_meta": rewrite_meta,
+        }
+
+    retrieval_sub_queries: List[str] = []
+    sub_query_rewrites: List[Dict[str, Any]] = []
+    total_rewrite_ms = 0.0
+    any_rewrite_applied = False
+    max_history_messages_used = 0
+    rewrite_model = ""
+
+    for index, sub_query in enumerate(query_labels):
+        bridged_query = _build_compound_local_bridge_query(sub_query, query_labels[:index])
+        if bridged_query != sub_query:
+            retrieval_query = bridged_query
+            sub_meta = {
+                "applied": True,
+                "reason": "compound_local_context_bridge",
+                "timing_ms": 0.0,
+                "history_messages_used": 1,
+                "model": "",
+            }
+        else:
+            compound_history = _build_compound_rewrite_history(chat_history, query_labels[:index])
+            sub_meta = rewrite_query_with_context(
+                original_query=sub_query,
+                chat_history=compound_history,
+            )
+            retrieval_query = str(sub_meta.get("rewritten_query") or sub_query)
+
+        retrieval_sub_queries.append(retrieval_query)
+        sub_query_rewrites.append(
+            {
+                "original_query": sub_query,
+                "retrieval_query": retrieval_query,
+                "applied": bool(sub_meta.get("applied")),
+                "reason": str(sub_meta.get("reason") or "unknown"),
+                "timing_ms": float(sub_meta.get("timing_ms") or 0.0),
+                "history_messages_used": int(sub_meta.get("history_messages_used") or 0),
+                "model": str(sub_meta.get("model") or ""),
+            }
+        )
+        total_rewrite_ms += float(sub_meta.get("timing_ms") or 0.0)
+        any_rewrite_applied = any_rewrite_applied or bool(sub_meta.get("applied"))
+        max_history_messages_used = max(max_history_messages_used, int(sub_meta.get("history_messages_used") or 0))
+        if not rewrite_model:
+            rewrite_model = str(sub_meta.get("model") or "")
+
+    return {
+        "query_labels": query_labels,
+        "retrieval_sub_queries": retrieval_sub_queries,
+        "rewrite_meta": {
+            "applied": any_rewrite_applied,
+            "rewritten_query": original_query,
+            "reason": "compound_subquery_rewrite",
+            "timing_ms": round(total_rewrite_ms, 2),
+            "history_messages_used": max_history_messages_used,
+            "model": rewrite_model,
+            "sub_query_rewrites": sub_query_rewrites,
+        },
+    }
+
+
+def _apply_reusable_sub_query_support(
+    vector_store_instance,
+    selected_results: List[Dict[str, Any]],
+    sub_query_support: List[Dict[str, Any]],
+    unsupported_sub_queries: List[str],
+    min_score: float,
+) -> Dict[str, Any]:
+    reuse_min_score = float(min_score)
+    if reuse_min_score > 0.45:
+        # 这里的复核只在“已经正式入选的 evidence 页”上做，
+        # 不再面对全库误召回问题，所以阈值可以比直接检索略放宽一点。
+        reuse_min_score = max(0.45, reuse_min_score - 0.15)
+
+    prepared_results: List[Dict[str, Any]] = []
+    result_lookup: Dict[tuple, Dict[str, Any]] = {}
+    for item in selected_results:
+        cloned = dict(item)
+        direct_queries = [str(query).strip() for query in cloned.get("matched_sub_queries", []) if str(query).strip()]
+        cloned["direct_supported_sub_queries"] = direct_queries
+        cloned["reused_supported_sub_queries"] = [
+            str(query).strip() for query in cloned.get("reused_supported_sub_queries", []) if str(query).strip()
+        ]
+        prepared_results.append(cloned)
+        result_lookup[_result_identity(cloned)] = cloned
+
+    if not prepared_results or not unsupported_sub_queries:
+        return {
+            "results": prepared_results,
+            "direct_unsupported_sub_queries": list(unsupported_sub_queries),
+            "final_unsupported_sub_queries": list(unsupported_sub_queries),
+            "reused_supported_sub_queries": [],
+            "reuse_support_details": [],
+            "reuse_min_score": reuse_min_score,
+        }
+
+    retrieval_query_lookup = {
+        str(item.get("query") or "").strip(): str(item.get("retrieval_query") or item.get("query") or "").strip()
+        for item in sub_query_support
+        if str(item.get("query") or "").strip()
+    }
+
+    reused_supported_sub_queries: List[str] = []
+    final_unsupported_sub_queries: List[str] = []
+    reuse_support_details: List[Dict[str, Any]] = []
+
+    for sub_query in unsupported_sub_queries:
+        probe_query = retrieval_query_lookup.get(sub_query) or sub_query
+        support_entries = vector_store_instance.probe_query_support_for_results(
+            query_text=probe_query,
+            results=prepared_results,
+        )
+        best_score = 0.0
+        supported_pages: List[Dict[str, Any]] = []
+        reuse_applied = False
+
+        for entry in support_entries:
+            score = float(entry.get("score", 0.0))
+            best_score = max(best_score, score)
+            if score < reuse_min_score:
+                continue
+
+            key = (
+                entry.get("document_id", ""),
+                entry.get("page_number", -1),
+                entry.get("image_path", ""),
+            )
+            result = result_lookup.get(key)
+            if result is None:
+                continue
+
+            reused_queries = result.setdefault("reused_supported_sub_queries", [])
+            if sub_query not in reused_queries:
+                reused_queries.append(sub_query)
+            reuse_applied = True
+            supported_pages.append(
+                {
+                    "page_number": int(entry.get("page_number") or 0),
+                    "score": round(score, 2),
+                }
+            )
+
+        if reuse_applied:
+            reused_supported_sub_queries.append(sub_query)
+        else:
+            final_unsupported_sub_queries.append(sub_query)
+
+        reuse_support_details.append(
+            {
+                "query": sub_query,
+                "probe_query": probe_query,
+                "best_selected_evidence_score": round(best_score, 2),
+                "reuse_applied": reuse_applied,
+                "supported_pages": supported_pages,
+            }
+        )
+
+    return {
+        "results": prepared_results,
+        "direct_unsupported_sub_queries": list(unsupported_sub_queries),
+        "final_unsupported_sub_queries": final_unsupported_sub_queries,
+        "reused_supported_sub_queries": reused_supported_sub_queries,
+        "reuse_support_details": reuse_support_details,
+        "reuse_min_score": reuse_min_score,
+    }
 
 
 def _merge_result_groups(
@@ -160,6 +435,7 @@ def _merge_result_groups(
 
 def _aggregate_compound_retrieval_timing(
     sub_queries: List[str],
+    retrieval_queries: List[str],
     timings: List[Dict[str, Any]],
     returned_points: int,
 ) -> Dict[str, Any]:
@@ -174,13 +450,14 @@ def _aggregate_compound_retrieval_timing(
         "sub_query_timings": [
             {
                 "query": sub_query,
+                "retrieval_query": retrieval_query,
                 "query_embedding_ms": timing.get("query_embedding_ms", 0.0),
                 "qdrant_query_ms": timing.get("qdrant_query_ms", 0.0),
                 "result_format_ms": timing.get("result_format_ms", 0.0),
                 "total_retrieval_ms": timing.get("total_retrieval_ms", 0.0),
                 "returned_points": timing.get("returned_points", 0),
             }
-            for sub_query, timing in zip(sub_queries, timings)
+            for sub_query, retrieval_query, timing in zip(sub_queries, retrieval_queries, timings)
         ],
     }
 
@@ -191,19 +468,49 @@ def _retrieve_compound_aware(
     document_ids: Optional[List[str]],
     top_k: int,
     min_score: float,
+    allow_compound_split: bool = True,
+    query_labels: Optional[List[str]] = None,
+    retrieval_queries: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    sub_queries = _split_compound_query(query_text)
+    normalized_query_text = re.sub(r"\s+", " ", (query_text or "").strip())
+    if query_labels and retrieval_queries and len(query_labels) == len(retrieval_queries):
+        sub_queries = [re.sub(r"\s+", " ", str(item or "").strip()) for item in query_labels if str(item or "").strip()]
+        normalized_retrieval_queries = [
+            re.sub(r"\s+", " ", str(item or "").strip())
+            for item in retrieval_queries[:len(sub_queries)]
+            if str(item or "").strip()
+        ]
+        if len(normalized_retrieval_queries) != len(sub_queries):
+            sub_queries = _split_compound_query(normalized_query_text) if allow_compound_split else ([normalized_query_text] if normalized_query_text else [])
+            normalized_retrieval_queries = list(sub_queries)
+    else:
+        sub_queries = _split_compound_query(normalized_query_text) if allow_compound_split else ([normalized_query_text] if normalized_query_text else [])
+        normalized_retrieval_queries = list(sub_queries)
+
     if len(sub_queries) <= 1:
+        retrieval_query_text = normalized_retrieval_queries[0] if normalized_retrieval_queries else (normalized_query_text or query_text)
         retrieval_payload = vector_store_instance.retrieve_with_two_stage(
-            query_text=query_text,
+            query_text=retrieval_query_text,
             document_ids=document_ids,
             top_k=top_k,
         )
         results = retrieval_payload["results"]
+        selected_results = _filter_results_by_min_score(results, min_score)
+        sub_query_text = sub_queries[0] if sub_queries else retrieval_query_text
         return {
             "sub_queries": sub_queries or [query_text],
+            "retrieval_sub_queries": normalized_retrieval_queries or [retrieval_query_text],
             "results": results,
-            "selected_results": _filter_results_with_fallback(results, min_score),
+            "selected_results": selected_results,
+            "unsupported_sub_queries": [] if selected_results else ([sub_query_text] if sub_query_text else []),
+            "sub_query_support": [
+                {
+                    "query": sub_query_text,
+                    "retrieval_query": retrieval_query_text,
+                    "best_score": _best_result_score(results),
+                    "selected_count": len(selected_results),
+                }
+            ] if sub_query_text else [],
             "timing": retrieval_payload["timing"],
         }
 
@@ -214,26 +521,42 @@ def _retrieve_compound_aware(
     raw_result_groups: List[List[Dict[str, Any]]] = []
     selected_result_groups: List[List[Dict[str, Any]]] = []
     sub_query_timings: List[Dict[str, Any]] = []
+    unsupported_sub_queries: List[str] = []
+    sub_query_support: List[Dict[str, Any]] = []
 
-    for sub_query in sub_queries:
+    for sub_query, retrieval_query in zip(sub_queries, normalized_retrieval_queries):
         retrieval_payload = vector_store_instance.retrieve_with_two_stage(
-            query_text=sub_query,
+            query_text=retrieval_query,
             document_ids=document_ids,
             top_k=per_sub_query_top_k,
         )
         raw_results = retrieval_payload["results"]
+        selected_results = _filter_results_by_min_score(raw_results, min_score)
         raw_result_groups.append(raw_results)
-        selected_result_groups.append(_filter_results_with_fallback(raw_results, min_score))
+        selected_result_groups.append(selected_results)
         sub_query_timings.append(retrieval_payload["timing"])
+        if not selected_results:
+            unsupported_sub_queries.append(sub_query)
+        sub_query_support.append(
+            {
+                "query": sub_query,
+                "retrieval_query": retrieval_query,
+                "best_score": _best_result_score(raw_results),
+                "selected_count": len(selected_results),
+            }
+        )
 
     merged_results = _merge_result_groups(raw_result_groups, sub_queries, candidate_limit)
     merged_selected_results = _merge_result_groups(selected_result_groups, sub_queries, selected_limit)
 
     return {
         "sub_queries": sub_queries,
+        "retrieval_sub_queries": normalized_retrieval_queries,
         "results": merged_results,
         "selected_results": merged_selected_results,
-        "timing": _aggregate_compound_retrieval_timing(sub_queries, sub_query_timings, len(merged_results)),
+        "unsupported_sub_queries": unsupported_sub_queries,
+        "sub_query_support": sub_query_support,
+        "timing": _aggregate_compound_retrieval_timing(sub_queries, normalized_retrieval_queries, sub_query_timings, len(merged_results)),
     }
 
 
@@ -505,26 +828,108 @@ async def chat(request: Request, req: ChatRequest):
     results = []
     score_filtered: List[Dict[str, Any]] = []
     retrieval_timing = None
-    sub_queries = [req.query]
+    retrieval_query = req.query
+    query_plan = _plan_retrieval_queries(req.query, req.chat_history)
+    original_sub_queries = list(query_plan.get("query_labels") or [req.query])
+    retrieval_sub_queries = list(query_plan.get("retrieval_sub_queries") or [req.query])
+    compound_split_allowed = len(original_sub_queries) > 1
+    sub_queries = original_sub_queries or [req.query]
+    unsupported_sub_queries: List[str] = []
+    rewrite_meta: Dict[str, Any] = dict(query_plan.get("rewrite_meta") or {
+        "applied": False,
+        "rewritten_query": req.query,
+        "reason": "not_attempted",
+        "timing_ms": 0.0,
+        "sub_query_rewrites": [],
+    })
+    if len(retrieval_sub_queries) == 1:
+        retrieval_query = retrieval_sub_queries[0]
 
     # ── 同步完成 RAG 检索（流式响应开始前必须就绪）──
     if not pre_guard:
         retrieval_payload = _retrieve_compound_aware(
             vector_store_instance=vector_store_instance,
-            query_text=req.query,
+            query_text=retrieval_query,
             document_ids=req.document_ids,
             top_k=req.top_k,
             min_score=req.min_score,
+            allow_compound_split=compound_split_allowed,
+            query_labels=original_sub_queries,
+            retrieval_queries=retrieval_sub_queries,
         )
         results = retrieval_payload["results"]
         score_filtered = retrieval_payload["selected_results"]
+        unsupported_sub_queries = list(retrieval_payload.get("unsupported_sub_queries") or [])
         retrieval_timing = retrieval_payload["timing"]
+        retrieval_timing.update(
+            {
+                "rewrite_applied": bool(rewrite_meta.get("applied")),
+                "rewrite_ms": float(rewrite_meta.get("timing_ms") or 0.0),
+                "rewrite_reason": str(rewrite_meta.get("reason") or "unknown"),
+                "rewrite_history_messages": int(rewrite_meta.get("history_messages_used") or 0),
+                "rewrite_model": str(rewrite_meta.get("model") or ""),
+                "retrieval_query": retrieval_query,
+                "retrieval_sub_queries": retrieval_sub_queries,
+                "sub_query_rewrites": list(rewrite_meta.get("sub_query_rewrites") or []),
+                "original_sub_query_count": len(original_sub_queries) or 1,
+                "compound_split_applied": compound_split_allowed,
+                "compound_split_source": "original_query",
+                "min_score_applied": float(req.min_score),
+                "unsupported_sub_query_count": len(unsupported_sub_queries),
+                "unsupported_sub_queries": unsupported_sub_queries,
+                "sub_query_support": list(retrieval_payload.get("sub_query_support") or []),
+            }
+        )
         sub_queries = retrieval_payload["sub_queries"]
 
     _rebuild_image_cache_if_needed(results)
     valid_results = [r for r in score_filtered if os.path.exists(str(r.get("image_path", "")))]
+    reuse_support_meta = _apply_reusable_sub_query_support(
+        vector_store_instance=vector_store_instance,
+        selected_results=valid_results,
+        sub_query_support=list(retrieval_timing.get("sub_query_support") or []) if retrieval_timing else [],
+        unsupported_sub_queries=unsupported_sub_queries,
+        min_score=req.min_score,
+    ) if (not pre_guard and valid_results) else {
+        "results": [
+            {
+                **dict(item),
+                "direct_supported_sub_queries": list(item.get("matched_sub_queries", [])),
+                "reused_supported_sub_queries": [],
+            }
+            for item in valid_results
+        ],
+        "direct_unsupported_sub_queries": list(unsupported_sub_queries),
+        "final_unsupported_sub_queries": list(unsupported_sub_queries),
+        "reused_supported_sub_queries": [],
+        "reuse_support_details": [],
+        "reuse_min_score": float(req.min_score),
+    }
+    valid_results = reuse_support_meta["results"]
+    direct_unsupported_sub_queries = list(reuse_support_meta.get("direct_unsupported_sub_queries") or [])
+    unsupported_sub_queries = list(reuse_support_meta.get("final_unsupported_sub_queries") or [])
+    reused_supported_sub_queries = list(reuse_support_meta.get("reused_supported_sub_queries") or [])
     evidence_images = [r["image_path"] for r in valid_results if r.get("image_path")]
     confidence = _build_confidence_summary(valid_results)
+    crop_highlight_payload = vector_store_instance.build_crop_regions_for_results(
+        results=valid_results,
+        fallback_query_text=retrieval_query,
+    ) if (not pre_guard and valid_results) else {"regions": {}, "count": 0, "timing_ms": 0.0}
+    crop_regions = crop_highlight_payload.get("regions", {})
+    if retrieval_timing is not None:
+        retrieval_timing.update(
+            {
+                "crop_highlight_ms": float(crop_highlight_payload.get("timing_ms") or 0.0),
+                "crop_highlight_count": int(crop_highlight_payload.get("count") or 0),
+                "direct_unsupported_sub_queries": direct_unsupported_sub_queries,
+                "unsupported_sub_queries": unsupported_sub_queries,
+                "unsupported_sub_query_count": len(unsupported_sub_queries),
+                "reused_supported_sub_queries": reused_supported_sub_queries,
+                "reused_supported_sub_query_count": len(reused_supported_sub_queries),
+                "reuse_probe_min_score": float(reuse_support_meta.get("reuse_min_score") or req.min_score),
+                "reuse_support_details": list(reuse_support_meta.get("reuse_support_details") or []),
+            }
+        )
 
     used_keys = {(r.get("document_id", ""), r.get("page_number", -1)) for r in valid_results}
     evidence_id_map = {}
@@ -537,19 +942,30 @@ async def chat(request: Request, req: ChatRequest):
         key = (r.get("document_id", ""), r.get("page_number", -1))
         evidence_id = f"E{index}"
         evidence_id_map[key] = evidence_id
+        direct_supported_sub_queries = list(r.get("direct_supported_sub_queries", []))
+        reused_supported_sub_queries = list(r.get("reused_supported_sub_queries", []))
+        all_supported_sub_queries = direct_supported_sub_queries + [
+            query for query in reused_supported_sub_queries if query not in direct_supported_sub_queries
+        ]
         evidence_context.append({
             "evidence_id": evidence_id,
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
-            "matched_sub_queries": list(r.get("matched_sub_queries", [])),
+            "matched_sub_queries": direct_supported_sub_queries,
+            "direct_supported_sub_queries": direct_supported_sub_queries,
+            "reused_supported_sub_queries": reused_supported_sub_queries,
+            "all_supported_sub_queries": all_supported_sub_queries,
         })
         frontend_evidences.append({
             "evidence_id": evidence_id,
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
-            "image_base64": image_path_to_base64(image_path)
+            "image_base64": image_path_to_base64(image_path),
+            "matched_sub_queries": direct_supported_sub_queries,
+            "reused_supported_sub_queries": reused_supported_sub_queries,
+            "crop_region": crop_regions.get(key),
         })
 
     # 全部候选页（top_k 个，含未被 min_score 采用的），供前端展示所有得分
@@ -559,14 +975,29 @@ async def chat(request: Request, req: ChatRequest):
         if not image_path:
             continue
         key = (r.get("document_id", ""), r.get("page_number", -1))
+        score = float(r.get("score", 0.0))
+        unused_reason = None
+        if key not in used_keys:
+            unused_reason = f"低于阈值 {req.min_score:.2f} 未采用" if score < req.min_score else "未进入最终正式依据"
         all_candidates_fe.append({
             "evidence_id": evidence_id_map.get(key),
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
-            "score": float(r.get("score", 0.0)),
+            "score": score,
             "image_base64": image_path_to_base64(image_path),
+            "matched_sub_queries": list(r.get("matched_sub_queries", [])),
+            "crop_region": crop_regions.get(key),
             "is_used": key in used_keys,
+            "unused_reason": unused_reason,
         })
+
+    if retrieval_timing is not None:
+        retrieval_timing.update(
+            {
+                "selected_evidence_count": len(frontend_evidences),
+                "unused_candidate_count": sum(1 for item in all_candidates_fe if not item.get("is_used")),
+            }
+        )
 
     if pre_guard:
         guard_payload = pre_guard
@@ -584,14 +1015,16 @@ async def chat(request: Request, req: ChatRequest):
         )
     else:
         logger.info(
-            "chat_retrieval timing=%s confidence=%s document_scope=%s sub_queries=%s",
+            "chat_retrieval timing=%s confidence=%s document_scope=%s sub_queries=%s rewrite=%s",
             retrieval_timing,
             confidence,
             req.document_ids,
             sub_queries,
+            rewrite_meta,
         )
         print(
             f"[Chat] confidence={confidence} timing={retrieval_timing} "
+            f"rewrite_applied={rewrite_meta.get('applied')} retrieval_query={retrieval_query!r} "
             f"document_scope={req.document_ids} sub_queries={sub_queries}"
         )
 
@@ -606,12 +1039,13 @@ async def chat(request: Request, req: ChatRequest):
         if await request.is_disconnected():
             return
 
+        yield f"data: {json.dumps({'type': 'evidences', 'data': {'evidences': frontend_evidences, 'all_candidates': all_candidates_fe, 'confidence': confidence, 'retrieval_timing': retrieval_timing}})}\n\n"
+
         if not evidence_images:
-            yield f"data: {json.dumps({'type': 'error', 'data': '抱歉，未能检索出与该问题高度匹配的页面。'})}\n\n"
+            no_evidence_answer = _build_insufficient_evidence_answer(req.min_score, sub_queries)
+            yield f"data: {json.dumps({'type': 'token', 'data': no_evidence_answer})}\n\n"
             yield "data: [DONE]\n\n"
             return
-
-        yield f"data: {json.dumps({'type': 'evidences', 'data': {'evidences': frontend_evidences, 'all_candidates': all_candidates_fe, 'confidence': confidence, 'retrieval_timing': retrieval_timing}})}\n\n"
 
         # ── 事件 2..N: 逐 token 文字 ──
         token_stream = generate_answer_stream(
@@ -620,6 +1054,7 @@ async def chat(request: Request, req: ChatRequest):
             chat_history=req.chat_history,
             evidence_context=evidence_context,
             sub_queries=sub_queries,
+            unsupported_sub_queries=unsupported_sub_queries,
         )
         generation_start = time.perf_counter()
         first_token_ms = None

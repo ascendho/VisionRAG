@@ -107,6 +107,7 @@ function toggleEvidenceSection(msgId, forceExpanded = null) {
     ? panel.style.display === 'none'
     : forceExpanded;
   const count = Number(button.dataset.count || 0);
+  const collapsedMeta = button.dataset.collapsedMeta || `默认收起 · 共 ${count} 条依据`;
   const label = button.querySelector('[data-evidence-label]');
   const meta = button.querySelector('[data-evidence-meta]');
   const icon = button.querySelector('svg');
@@ -114,7 +115,7 @@ function toggleEvidenceSection(msgId, forceExpanded = null) {
   panel.style.display = shouldExpand ? 'block' : 'none';
   button.setAttribute('aria-expanded', shouldExpand ? 'true' : 'false');
   if (label) label.textContent = shouldExpand ? '收起依据' : '查看依据';
-  if (meta) meta.textContent = shouldExpand ? '已展开引用来源' : `默认收起 · 共 ${count} 条依据`;
+  if (meta) meta.textContent = shouldExpand ? '已展开引用来源' : collapsedMeta;
   if (icon) icon.style.transform = shouldExpand ? 'rotate(180deg)' : 'rotate(0deg)';
   return shouldExpand;
 }
@@ -1173,10 +1174,43 @@ function addUserMessage(text) {
   scrollToBottom();
 }
 
+function buildEvidenceCropOverlayMarkup(cropRegion) {
+  if (!cropRegion) return '';
+
+  const leftPct = Math.max(0, Math.min(100, Number(cropRegion.left_pct)));
+  const topPct = Math.max(0, Math.min(100, Number(cropRegion.top_pct)));
+  const widthPct = Math.max(0, Math.min(100 - leftPct, Number(cropRegion.width_pct)));
+  const heightPct = Math.max(0, Math.min(100 - topPct, Number(cropRegion.height_pct)));
+  if (!Number.isFinite(leftPct) || !Number.isFinite(topPct) || !Number.isFinite(widthPct) || !Number.isFinite(heightPct)) {
+    return '';
+  }
+  if (widthPct <= 0 || heightPct <= 0) return '';
+
+  const alpha = Math.max(0.18, Math.min(0.38, Number(cropRegion.confidence || 0.24)));
+  const title = cropRegion.query_text
+    ? `高亮命中区域 · ${escapeHtml(cropRegion.query_text)}`
+    : '高亮命中区域';
+
+  return `<div class="evidence-crop-overlay" style="left:${leftPct}%;top:${topPct}%;width:${widthPct}%;height:${heightPct}%;--crop-alpha:${alpha.toFixed(2)};" title="${title}"></div>`;
+}
+
+function buildMatchedSubQueryMarkup(matchedSubQueries = []) {
+  const firstMatchedQuery = (matchedSubQueries || []).find((item) => String(item || '').trim());
+  if (!firstMatchedQuery) return '';
+  const escapedQuery = escapeHtml(String(firstMatchedQuery).trim());
+  return `<p class="evidence-subquery" title="${escapedQuery}">命中：${escapedQuery}</p>`;
+}
+
 function _buildEvidenceCards(msgId, evidences, allCandidates) {
-  if (!evidences || evidences.length === 0) return '';
-  const cards = evidences.map(ev => {
+  const formalEvidences = Array.isArray(evidences) ? evidences : [];
+  const allCandidatePages = Array.isArray(allCandidates) ? allCandidates : [];
+  const unused = allCandidatePages.filter(c => !c.is_used);
+  if (formalEvidences.length === 0 && unused.length === 0) return '';
+
+  const cards = formalEvidences.map(ev => {
     const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
+    const cropOverlay = buildEvidenceCropOverlayMarkup(ev.crop_region);
+    const matchedSubQuery = buildMatchedSubQueryMarkup(ev.matched_sub_queries);
     const evidenceBadge = ev.evidence_id
       ? `<span class="evidence-chip">${ev.evidence_id}</span>`
       : '';
@@ -1187,6 +1221,7 @@ function _buildEvidenceCards(msgId, evidences, allCandidates) {
       <div ${evidenceAttrs} class="evidence-card w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}')">
         <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: 4/3;">
           <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
+          ${cropOverlay}
           <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 dark:group-hover:bg-white/10 transition-colors flex items-center justify-center">
             <svg class="w-6 h-6 text-white opacity-0 group-hover:opacity-100 transition-opacity drop-shadow-md" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
           </div>
@@ -1195,28 +1230,30 @@ function _buildEvidenceCards(msgId, evidences, allCandidates) {
         <div class="p-2.5">
           <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
           <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} · ${ev.score.toFixed(2)}</p>
+          ${matchedSubQuery}
         </div>
       </div>`;
   }).join('');
 
-  // 未被采用的候选页（得分不足 min_score 或排名靠后）
-  const unused = (allCandidates || []).filter(c => !c.is_used);
   let disclosureHtml = '';
   if (unused.length > 0) {
     const toggleId = 'all-cands-' + Date.now();
     const unusedCards = unused.map(ev => {
       const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
+      const unusedReason = String(ev.unused_reason || '').trim();
+      const escapedReason = unusedReason ? escapeHtml(unusedReason) : '未采用';
       return `
         <div class="w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group opacity-50 hover:opacity-80" onclick="openImageModal('${imgSrc}')">
           <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: 4/3;">
             <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
             <div class="absolute top-1.5 left-1.5">
-              <span class="text-[10px] bg-[#e8eaed] dark:bg-slate-700 text-[#80868b] dark:text-slate-400 px-1.5 py-0.5 rounded-full font-medium">未采用</span>
+              <span title="${escapedReason}" class="text-[10px] bg-[#e8eaed] dark:bg-slate-700 text-[#80868b] dark:text-slate-400 px-1.5 py-0.5 rounded-full font-medium">未采用</span>
             </div>
           </div>
           <div class="p-2.5">
             <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
             <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} · ${ev.score.toFixed(2)}</p>
+            ${unusedReason ? `<p class="text-[10px] text-[#b3261e] dark:text-red-400 mt-0.5">${escapedReason}</p>` : ''}
           </div>
         </div>`;
     }).join('');
@@ -1230,18 +1267,29 @@ function _buildEvidenceCards(msgId, evidences, allCandidates) {
       </div>`;
   }
 
+  const primarySectionHtml = formalEvidences.length > 0
+    ? `
+        <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-3 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">${cards}</div>`
+    : `
+        <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-1 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
+        <p class="text-[12px] text-[#80868b] dark:text-slate-400 pl-1">当前没有达到采用阈值的正式依据，下面仅保留未采用候选供调试查看。</p>`;
+
+  const disclosureMeta = formalEvidences.length > 0
+    ? `默认收起 · 共 ${formalEvidences.length} 条依据${unused.length > 0 ? `，${unused.length} 条未采用候选` : ''}`
+    : `默认收起 · 当前无正式依据${unused.length > 0 ? `，${unused.length} 条未采用候选` : ''}`;
+
   return `
     <div class="mt-4 w-full evidence-disclosure">
-      <button id="evidence-toggle-${msgId}" data-count="${evidences.length}" type="button" onclick="toggleEvidenceSection('${msgId}')" aria-expanded="false" class="evidence-disclosure-toggle">
+      <button id="evidence-toggle-${msgId}" data-count="${formalEvidences.length}" data-collapsed-meta="${escapeHtml(disclosureMeta)}" type="button" onclick="toggleEvidenceSection('${msgId}')" aria-expanded="false" class="evidence-disclosure-toggle">
         <span class="evidence-disclosure-copy">
           <span class="evidence-disclosure-title" data-evidence-label>查看依据</span>
-          <span class="evidence-disclosure-meta" data-evidence-meta>默认收起 · 共 ${evidences.length} 条依据</span>
+          <span class="evidence-disclosure-meta" data-evidence-meta>${disclosureMeta}</span>
         </span>
         <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 transition-transform duration-200" style="transform:rotate(0deg)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
       </button>
       <div id="evidence-body-${msgId}" style="display:none" class="evidence-disclosure-body">
-        <p class="text-[11px] font-semibold text-[#80868b] dark:text-slate-400 mb-3 uppercase tracking-wider pl-1">参考源 (Source Evidence)</p>
-        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">${cards}</div>
+        ${primarySectionHtml}
         ${disclosureHtml}
       </div>
     </div>`;

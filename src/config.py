@@ -1,37 +1,72 @@
+"""项目核心配置。
+
+这个文件是整条 RAG 链路的最低层依赖，负责集中定义：
+1. 外部服务地址，例如 Qdrant 和 Doubao API。
+2. 检索与输入约束，例如 Top-K、最低分阈值、查询长度上限。
+3. 中间产物目录，例如文档页图片缓存目录。
+
+之所以把这些配置放在一个文件里，而不是散落在各个模块中，是为了让
+`doc_processor.py`、`vector_store.py`、`llm_generator.py` 在读取运行参数时
+都共享同一套事实来源，避免出现不同模块各自维护默认值的情况。
+"""
+
 import os
 import tempfile
 from dotenv import load_dotenv
 
-# 加载当前目录下的 .env 文件中定义的环境变量
+# 在模块导入阶段就读取 `.env`，这样后续所有模块拿到的都是统一配置。
 load_dotenv()
 
-# 设置 Hugging Face 国内镜像源，解决下载 SSL/TLS 连接断开的问题
+# ColPali 权重通常从 Hugging Face 下载。
+# 这里允许通过国内镜像源减少网络不稳定带来的下载失败，尤其适合本地开发环境。
 os.environ["HF_ENDPOINT"] = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
 
-# Qdrant 数据库连接地址（本地 Docker 环境运行 Qdrant）
+# Qdrant 是本项目的向量数据库，用来保存每一页文档的多向量表示并执行检索。
+# 默认指向本地 Docker 容器暴露的 6333 端口。
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 
-# 火山引擎相关参数
+# Doubao 是最终负责“看证据页并组织答案”的多模态大模型。
+# 这里保留 API Key 和模型名两个最核心的外部调用参数。
 ARK_API_KEY = os.getenv("ARK_API_KEY")
 DOUBAO_MODEL_NAME = os.getenv("DOUBAO_MODEL_NAME", "doubao-seed-2-0-pro-260215")
 
-# 向量数据库的集合（Collection）名称
+# 所有文档页向量都落到同一个集合中，再通过 payload 中的 document_id 做过滤。
 COLLECTION_NAME = "colpali-rag-collection"
 
-# 检索与输入控制参数
+# 这些参数共同决定了“用户问题如何进入后端”以及“检索结果如何被截断”。
+# - DEFAULT_TOP_K: 默认最多把多少页候选证据送入后续流程。
+# - DEFAULT_MIN_SCORE: 低于该分数的页面默认视为不够相关。
+# - MAX_QUERY_CHARS: 防止异常超长输入把检索和生成链路拖慢。
+# - QUERY_GUARD_ENABLED: 是否启用对明显闲聊/越界问题的前置拦截。
 DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "3"))
 DEFAULT_MIN_SCORE = float(os.getenv("DEFAULT_MIN_SCORE", "0.6"))
 MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "800"))
 QUERY_GUARD_ENABLED = os.getenv("QUERY_GUARD_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
-# 临时存放 PDF 生成图片的目录，避免每次都转换。
-# 放在系统临时目录，避免触发 uvicorn --reload 对项目目录变更的热重启。
+# 多轮检索改写配置。
+# 这组参数只影响“送去检索的查询”，不会改写用户在聊天界面里看到的原始问题。
+QUERY_REWRITE_ENABLED = os.getenv("QUERY_REWRITE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+QUERY_REWRITE_MODEL_NAME = os.getenv("QUERY_REWRITE_MODEL_NAME", "ep-m-20260411093114-9hftc")
+QUERY_REWRITE_MAX_HISTORY_MESSAGES = int(os.getenv("QUERY_REWRITE_MAX_HISTORY_MESSAGES", "4"))
+QUERY_REWRITE_TIMEOUT_MS = int(os.getenv("QUERY_REWRITE_TIMEOUT_MS", "2500"))
+QUERY_REWRITE_TRIGGER_MAX_CHARS = int(os.getenv("QUERY_REWRITE_TRIGGER_MAX_CHARS", "48"))
+
+# Patch 高亮配置。
+# 第一版只做对最终采用证据页的粗粒度红框高亮，因此限制默认保持保守。
+PATCH_HIGHLIGHT_ENABLED = os.getenv("PATCH_HIGHLIGHT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+PATCH_HIGHLIGHT_TOP_N = int(os.getenv("PATCH_HIGHLIGHT_TOP_N", "3"))
+PATCH_HIGHLIGHT_MIN_SCORE = float(os.getenv("PATCH_HIGHLIGHT_MIN_SCORE", "0.6"))
+
+# 文档页图片缓存目录。
+# 所有 PDF / 图片 / 文本在进入向量化之前，都会先被标准化为页面图片并缓存在这里。
+# 之所以放到系统临时目录，而不是项目目录，是为了避免 `uvicorn --reload`
+# 监听到大量缓存文件变更后频繁热重启。
 IMAGE_CACHE_DIR = os.getenv(
 	"IMAGE_CACHE_DIR",
 	os.path.join(tempfile.gettempdir(), "rag_cache_images")
 )
 os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
 
-# ColPali 视觉语言模型名称
-# 使用 vidore/colpali-v1.3 为文档和查询生成多模态特征向量（Embeddings）
+# ColPali 是检索侧的视觉-语言模型。
+# 它不负责生成自然语言答案，而是把“文档页图片”和“用户问题”编码成可检索的多向量表示。
 COLPALI_MODEL_NAME = "vidore/colpali-v1.3"

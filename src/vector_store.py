@@ -1,10 +1,26 @@
+"""视觉向量存储与检索模块。
+
+这个文件实现了项目里最核心的“检索侧”能力：
+1. 把文档页图片送入 ColPali，得到可用于 Late Interaction 的多向量表示。
+2. 再把原始多向量压缩成 MUVERA 表示，用于第一阶段快速召回。
+3. 把两套向量一起写入 Qdrant，并在查询时执行“两阶段检索”：
+    先用压缩向量粗召回，再用原始多向量精排。
+
+如果把整个项目看成一条流水线，那么：
+- `doc_processor.py` 负责把输入变成页面图；
+- 这里负责把页面图变成“可检索的向量索引”；
+- `llm_generator.py` 则负责把检索出的证据页交给大模型生成答案。
+"""
+
 import hashlib
 import logging
 import time
 from typing import Any, Dict, List, Optional
 import warnings
 
-# 过滤并忽略 PyTorch 在部分系统中无伤大雅的类发现警告
+import numpy as np
+
+# 屏蔽一类已知但通常无害的 PyTorch 警告，避免本地终端被噪声刷屏。
 warnings.filterwarnings("ignore", message=".*Tried to instantiate class.*")
 
 from qdrant_client import QdrantClient, models
@@ -13,42 +29,55 @@ import torch
 from colpali_engine.models import ColPali, ColPaliProcessor
 from PIL import Image
 
-from src.config import QDRANT_URL, COLLECTION_NAME, COLPALI_MODEL_NAME
+from src.config import (
+    COLLECTION_NAME,
+    COLPALI_MODEL_NAME,
+    PATCH_HIGHLIGHT_ENABLED,
+    PATCH_HIGHLIGHT_MIN_SCORE,
+    PATCH_HIGHLIGHT_TOP_N,
+    QDRANT_URL,
+)
 
 logger = logging.getLogger(__name__)
 
+
 class VisionVectorStore:
     """
-    视觉向量数据库服务类，封装了 ColPali 多模特征模型、MUVERA 聚类压缩及 Qdrant 本地数据库操作。
-    主要职责：
-    1. 使用预训练视觉-语言大模型（ColPali）将包含文本图片的文档页转化为稠密多维度特征（Multi-Vector Embedding）。
-    2. 计算 MUVERA（聚类降维表示）加速在大规模文档下的第一阶段海选检索（Prefetch）。
-    3. 连接并操作 Qdrant，保障两阶段检索流程。
+    视觉向量数据库服务。
+
+    这个类把“建索引”和“查索引”两件事都包了起来：
+    1. 建索引时，把每一页文档图片编码成 ColPali 原始多向量，并额外生成 MUVERA 压缩向量。
+    2. 查索引时，先用 MUVERA 压缩向量做第一阶段粗召回，再用 ColPali 原始多向量精排。
+    3. 最终把结果组织成上层编排代码更容易消费的字典结构。
+
+    之所以不直接只存一套原始向量，是因为原始多向量虽然精度高，但全量扫描成本也高；
+    增加一套压缩表示后，可以先快速缩小候选范围，再对少量候选做高精度比较。
     """
+
     def __init__(self):
-        # 1. 链接至本地 Docker 容器启动的 Qdrant 数据库
-        # check_compatibility=False 屏蔽客户端与服务端的版本次要差异警告
+        # 连接本地 Qdrant。`check_compatibility=False` 是为了忽略次版本差异带来的提示，
+        # 避免开发环境中客户端与服务端小版本不完全一致时频繁报警。
         self.qdrant = QdrantClient(url=QDRANT_URL, check_compatibility=False)
         
-        # 2. 定义 MUVERA 实例进行维度压缩与计算加速
-        # 这是一种针对 Late-Interaction 模型的多维聚类方式，用于缓解在海量文档下搜索时的性能瓶颈
+        # MUVERA 负责把 ColPali 的原始多向量压缩成更短的表示，主要服务第一阶段粗召回。
+        # 可以把它理解成“牺牲一点点精度，换取更快的大范围候选筛选”。
         self.muvera = Muvera(
-            dim=128,          # ColPali 原始维度 128
-            k_sim=6,          # 聚类数目 (2^6 = 64 clusters)
-            dim_proj=16,      # 每一簇压缩至 16 维
-            r_reps=30,        # 重复 30 次随机投影（提升 Stage 1 近似精度，CPU 侧额外开销 <3ms）
-            random_seed=42,   # 固定随机种子确保线上复现性
+            dim=128,          # ColPali 单个向量 token 的原始维度。
+            k_sim=6,          # 聚类数量控制参数，对应 2^6 = 64 个聚类中心。
+            dim_proj=16,      # 压缩后每个聚类表示的维度，用于提升第一阶段检索速度。
+            r_reps=30,        # 重复投影次数越高，近似召回通常越稳定，但计算也会略增。
+            random_seed=42,   # 固定随机种子，确保实验结果和线上行为更容易复现。
         )
         
-        # 3. 初始化 ColPali 视觉语言大模型
-        # 判断当前硬件设备，具备 GPU 则用 GPU 加速推理
+        # 按硬件能力选择运行设备：优先 CUDA，其次 Apple MPS，最后退回 CPU。
         self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         
+        # processor 负责把图片或文本查询整理成模型可接受的张量输入。
         self.processor = ColPaliProcessor.from_pretrained(COLPALI_MODEL_NAME)
-        # 为节约本地显存，强烈建议在 Mac mps 或者普通 CPU 下使用 bfloat16 以避免 OOM：
+        # 使用 bfloat16 的主要目的是降低本地显存/内存压力，减少加载或推理时 OOM 的风险。
         dtype = torch.bfloat16
         
-        # 加上 low_cpu_mem_usage=True 是为防止一次性预热分配过大连续显存导致崩溃
+        # `low_cpu_mem_usage=True` 可以降低模型加载时的峰值内存压力。
         self.model = ColPali.from_pretrained(
             COLPALI_MODEL_NAME,
             torch_dtype=dtype,
@@ -56,21 +85,27 @@ class VisionVectorStore:
             low_cpu_mem_usage=True
         )
         
-        # 确保名为 colpali-rag-collection 的业务集合已建立，供入库和查询使用
+        # 启动时确保业务集合存在，这样上传与查询可以直接复用同一套结构定义。
         self._ensure_collection_exists()
 
     def _ensure_collection_exists(self):
         """
-        初始化核心的 Collection 结构。
-        在使用多向量（ColPali机制）时，为了实现前文提及的“两阶段检索”，这里必须定义两种不同结构的向量池：
-        1) "original": 完整的、未压缩的 ColPali 视觉多维表示（高精度，但扫描慢）。
-        2) "muvera_fde": 经过 MUVERA 降维策略的压缩特征（精度略损耗，但计算快）。
+        初始化 Qdrant 集合结构。
+
+        这里最关键的设计是：同一页文档会被写入两套向量池。
+        1. `original`: ColPali 原始多向量，精度高，用于第二阶段精排。
+        2. `muvera_fde`: MUVERA 压缩向量，体积更小，用于第一阶段粗召回。
+
+        只有把这两套向量都预先存好，查询时才能在一次检索流程里完成
+        “先快后准”的两阶段策略。
         """
         if not self.qdrant.collection_exists(COLLECTION_NAME):
             self.qdrant.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config={
-                    # 原生精确匹配向量 (ColPali 输出的尺寸，使用多向量模式 MULTIVECTOR)
+                    # 原始多向量：用于最终精排。
+                    # 这里使用 MAX_SIM，是因为 Late Interaction 模型通常会取 query token 与
+                    # document token 间的最佳匹配得分，再聚合成总体相关性。
                     "original": models.VectorParams(
                         size=128,
                         distance=models.Distance.COSINE,
@@ -78,7 +113,7 @@ class VisionVectorStore:
                             comparator=models.MultiVectorComparator.MAX_SIM
                         ),
                     ),
-                    # MUVERA 第一阶段快速召回（Prefetch）紧凑向量 
+                    # 压缩向量：用于第一阶段快速召回，先从全库中筛出较小候选集。
                     "muvera_fde": models.VectorParams(
                         size=16,
                         distance=models.Distance.DOT,
@@ -92,7 +127,7 @@ class VisionVectorStore:
     def reset_collection(self):
         """
         完全清空并重建当前的 Qdrant 集合。
-        主要用于每次项目重启时清除全部数据，避免状态膨胀。
+        这通常用于显式重置索引状态，而不是日常查询路径的一部分。
         """
         if self.qdrant.collection_exists(COLLECTION_NAME):
             self.qdrant.delete_collection(COLLECTION_NAME)
@@ -100,14 +135,23 @@ class VisionVectorStore:
 
     def _make_point_id(self, document_id: str, page_number: int) -> int:
         """
-        通过 document_id + page_number 生成稳定且可复现的 63-bit 整数 ID，避免哈希碰撞覆盖。
+        为“某个文档的某一页”生成稳定 ID。
+
+        使用稳定 ID 有两个直接好处：
+        1. 同一文档重复上传时，可以更可靠地覆盖旧数据而不是无限叠加。
+        2. 问题排查时，更容易把数据库中的点和具体页面对应起来。
+
+        这里额外裁成 63 bit，是为了保持在常见有符号整数范围内。
         """
         digest = hashlib.sha1(f"{document_id}:{page_number}".encode("utf-8")).hexdigest()
         return int(digest[:16], 16) & ((1 << 63) - 1)
 
     def _build_document_filter(self, document_ids: Optional[List[str]]) -> Optional[models.Filter]:
         """
-        根据文档 ID 列表构建 Qdrant 过滤器；为空时表示全库检索。
+        根据文档 ID 列表构建 Qdrant 过滤器。
+
+        上层如果传入 document_ids，就只在指定文档范围内检索；
+        否则默认在整库中搜索。
         """
         if not document_ids:
             return None
@@ -138,7 +182,9 @@ class VisionVectorStore:
 
     def delete_document(self, document_id: str):
         """
-        按文档 ID 删除历史向量，确保同一文档重复上传时不会累计脏数据。
+        按 document_id 删除旧页面向量。
+
+        这样做的主要目的是让同一文档重新上传时，不会把旧页和新页混在一起。
         """
         if not document_id:
             return
@@ -167,8 +213,15 @@ class VisionVectorStore:
         **_ignored,
     ) -> Dict[str, Any]:
         """
-        将转换好的 PDF 每页图片利用 ColPali 模型送入并转为稠密向量，通过 MUVERA 进行压缩扩展，然后写到 Qdrant 中。
-        采用分批处理（Batched Processing），防止由于页数太多导致本地显存或系统内存爆炸。
+        为一组页面图片建立索引并写入 Qdrant。
+
+        这个函数做了四件连续的事情：
+        1. 批量读取页面图片并送入 ColPali，得到原始多向量表示。
+        2. 对每一页的原始多向量再计算一份 MUVERA 压缩向量。
+        3. 把两套向量和页面元数据组装成 Qdrant Point。
+        4. 分批写入 Qdrant，避免单次请求体过大。
+
+        整个过程按批处理，是因为页面多时模型推理和中间张量都很占内存。
         
         参数:
             image_paths (List[str]): 用于处理和存储的多页图片的物理路径。
@@ -180,6 +233,7 @@ class VisionVectorStore:
         embedding_ms = 0.0
         point_build_ms = 0.0
 
+        # 同一 document_id 重新入库时，默认先清理旧页，避免历史脏数据残留。
         if replace_document:
             self.delete_document(document_id)
 
@@ -192,29 +246,30 @@ class VisionVectorStore:
 
             try:
                 embedding_start = time.perf_counter()
-                # 将图片信息预处理为 ColPali 模型可接收的格式 (类似 Vit 结合 LLaMA 预处理)
+                # 先把 PIL 图片转成 ColPali 所需的批量张量格式。
                 batch_inputs = self.processor.process_images(images).to(self.device).to(self.model.dtype)
 
                 with torch.no_grad():
-                    # 获取高质量多向量输出
+                    # 输出结果不是单个向量，而是一页对应多个 token 向量的多向量表示。
                     image_embeddings = self.model(**batch_inputs)
                 embedding_ms += (time.perf_counter() - embedding_start) * 1000
             finally:
+                # PIL 句柄及时关闭，避免大批量处理时文件句柄和内存积累。
                 for img in images:
                     img.close()
 
             point_build_start = time.perf_counter()
-            # 转换为 Numpy，接着使用 MUVERA 根据原本的多模态特征派生压缩版的加速特征
+            # 模型输出先转到 CPU/Numpy，便于后续交给 MUVERA 和 Qdrant 客户端处理。
             cpu_embeddings = [emb.float().cpu().numpy() for emb in image_embeddings]
             
             for j, (path, original_emb) in enumerate(zip(batch_paths, cpu_embeddings)):
-                # MUVERA 生成的结构可能受输入分辨率或页数影响，变为铺平的一维巨型数组
-                # 所以无论如何都在入库前强制经过防御性重塑 (Defensive Reshape) 到目标列维
+                # 无论上游输出形状如何，入库前都显式重塑成“若干行 x 128 列”。
+                # 这一步的目标是确保每一行都表示一个 token 向量，便于后续多向量检索。
                 original_emb_2d = original_emb.reshape(-1, 128)
                 muvera_embRaw = self.muvera.process_document(original_emb)
                 muvera_emb_2d = muvera_embRaw.reshape(-1, 16)
                 
-                # 使用页码作为稳定索引，避免多文档混写时覆盖。
+                # 页码从 1 开始，和用户看到的文档页概念保持一致。
                 page_number = i + j + 1
                 point = models.PointStruct(
                     id=self._make_point_id(document_id=document_id, page_number=page_number),
@@ -232,6 +287,7 @@ class VisionVectorStore:
                 points.append(point)
             point_build_ms += (time.perf_counter() - point_build_start) * 1000
                 
+        # 没有页面就直接返回失败结果，避免后续 upsert 空数组。
         if not points:
             return {
                 "ok": False,
@@ -246,8 +302,8 @@ class VisionVectorStore:
                 },
             }
 
-        # 分批 upsert，每批 8 个点，避免单次请求体超过 Qdrant 默认 32MB 上限
-        # 每页向量 JSON 约 1.94 MB（original 1.57 MB + muvera 0.37 MB），8 页 ≈ 15.5 MB，留足余量
+        # Qdrant 单次请求体过大时容易失败，所以这里继续把构建好的点分批提交。
+        # 之所以选择 8 页一批，是基于当前向量 JSON 体积做的保守上限控制。
         upsert_batch_size = 8
         upsert_start = time.perf_counter()
         for i in range(0, len(points), upsert_batch_size):
@@ -279,7 +335,7 @@ class VisionVectorStore:
     def get_all_documents(self) -> List[Dict[str, Any]]:
         """
         获取当前向量库中所有已装载的独立文件列表。
-        通过聚合 payload 中的 document_id 和 document_name 实现。
+        这里不是读取某张专门的“文档表”，而是通过滚动扫描页面点，再按 document_id 聚合。
         """
         try:
             records, _ = self.qdrant.scroll(
@@ -348,6 +404,251 @@ class VisionVectorStore:
         pages.sort(key=lambda item: item.get("page_number", 0))
         return pages[:limit]
 
+    def _encode_query_tokens(self, query_text: str) -> np.ndarray:
+        """把单条查询编码成 ColPali 查询多向量。"""
+        batch_queries = self.processor.process_queries([query_text]).to(self.device)
+        with torch.no_grad():
+            query_embedding_tensor = self.model(**batch_queries)[0]
+        query_embeddings = query_embedding_tensor.float().cpu().numpy().reshape(-1, 128)
+        return np.asarray(query_embeddings, dtype=np.float32)
+
+    def _load_original_vectors_for_page(self, document_id: str, page_number: int) -> Optional[np.ndarray]:
+        """从 Qdrant 中反查某一页保存的原始多向量。"""
+        try:
+            records, _ = self.qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="document_id",
+                            match=models.MatchValue(value=document_id),
+                        ),
+                        models.FieldCondition(
+                            key="page_number",
+                            match=models.MatchValue(value=int(page_number)),
+                        ),
+                    ]
+                ),
+                with_payload=False,
+                with_vectors=True,
+                limit=1,
+            )
+        except Exception as exc:
+            logger.warning(
+                "failed_to_load_original_vectors document_id=%s page_number=%s error=%s",
+                document_id,
+                page_number,
+                exc,
+            )
+            return None
+
+        if not records:
+            return None
+
+        record = records[0]
+        vector_payload = getattr(record, "vector", None)
+        if isinstance(vector_payload, dict):
+            original_vectors = vector_payload.get("original")
+            if original_vectors is None and vector_payload:
+                original_vectors = next(iter(vector_payload.values()))
+        else:
+            original_vectors = vector_payload
+
+        if original_vectors is None:
+            return None
+
+        original_array = np.asarray(original_vectors, dtype=np.float32)
+        if original_array.size == 0:
+            return None
+        if original_array.ndim == 1:
+            original_array = original_array.reshape(-1, 128)
+        return original_array
+
+    def _score_query_against_document_embeddings(
+        self,
+        query_embeddings: np.ndarray,
+        document_embeddings: np.ndarray,
+    ) -> float:
+        """用和检索阶段一致的 MaxSim 近似打分方式评估单页支持度。"""
+        if query_embeddings.size == 0 or document_embeddings.size == 0:
+            return 0.0
+
+        similarity_matrix = np.matmul(query_embeddings, document_embeddings.T)
+        if similarity_matrix.size == 0:
+            return 0.0
+
+        token_scores = similarity_matrix.max(axis=1)
+        n_query_tokens = max(int(query_embeddings.shape[0]), 1)
+        return float(token_scores.sum()) / n_query_tokens
+
+    def probe_query_support_for_results(
+        self,
+        query_text: str,
+        results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """只在已选 evidence 页上复核某个查询是否也能被这些页面支持。"""
+        normalized_query = str(query_text or "").strip()
+        if not normalized_query or not results:
+            return []
+
+        query_embeddings = self._encode_query_tokens(normalized_query)
+        support_entries: List[Dict[str, Any]] = []
+
+        for result in results:
+            document_id = str(result.get("document_id", ""))
+            page_number = int(result.get("page_number", 0) or 0)
+            image_path = str(result.get("image_path", ""))
+            if not document_id or page_number <= 0:
+                continue
+
+            document_embeddings = self._load_original_vectors_for_page(document_id=document_id, page_number=page_number)
+            if document_embeddings is None:
+                continue
+
+            support_score = self._score_query_against_document_embeddings(
+                query_embeddings=query_embeddings,
+                document_embeddings=document_embeddings,
+            )
+            support_entries.append(
+                {
+                    "document_id": document_id,
+                    "page_number": page_number,
+                    "image_path": image_path,
+                    "score": round(support_score, 4),
+                }
+            )
+
+        return support_entries
+
+    def _compute_crop_region_from_embeddings(
+        self,
+        query_embeddings: np.ndarray,
+        document_embeddings: np.ndarray,
+        image_path: str,
+        query_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """把查询多向量和文档页多向量映射成一个粗粒度高亮框。"""
+        if query_embeddings.size == 0 or document_embeddings.size == 0:
+            return None
+        if not image_path:
+            return None
+
+        similarity_matrix = np.matmul(query_embeddings, document_embeddings.T)
+        if similarity_matrix.size == 0:
+            return None
+
+        document_patch_scores = similarity_matrix.max(axis=0)
+        patch_token_count = int(document_patch_scores.shape[0])
+        if patch_token_count <= 0:
+            return None
+
+        selected_patch_count = max(4, min(24, max(1, patch_token_count // 12)))
+        top_patch_indices = np.argsort(document_patch_scores)[-selected_patch_count:]
+        if top_patch_indices.size == 0:
+            return None
+
+        grid_cols = max(1, int(round(float(np.sqrt(patch_token_count)))))
+        grid_rows = max(1, int(np.ceil(patch_token_count / grid_cols)))
+
+        patch_rows = [int(index) // grid_cols for index in top_patch_indices if int(index) < patch_token_count]
+        patch_cols = [int(index) % grid_cols for index in top_patch_indices if int(index) < patch_token_count]
+        if not patch_rows or not patch_cols:
+            return None
+
+        min_row = max(min(patch_rows) - 1, 0)
+        max_row = min(max(patch_rows) + 1, grid_rows - 1)
+        min_col = max(min(patch_cols) - 1, 0)
+        max_col = min(max(patch_cols) + 1, grid_cols - 1)
+
+        try:
+            with Image.open(image_path) as image:
+                page_width, page_height = image.size
+        except Exception:
+            return None
+
+        patch_width = page_width / grid_cols
+        patch_height = page_height / grid_rows
+        left = int(round(min_col * patch_width))
+        top = int(round(min_row * patch_height))
+        right = int(round((max_col + 1) * patch_width))
+        bottom = int(round((max_row + 1) * patch_height))
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+
+        score_min = float(document_patch_scores.min())
+        score_max = float(document_patch_scores.max())
+        score_span = max(score_max - score_min, 1e-6)
+        confidence = round((float(document_patch_scores[top_patch_indices].mean()) - score_min) / score_span, 2)
+
+        return {
+            "x": left,
+            "y": top,
+            "width": width,
+            "height": height,
+            "page_w": page_width,
+            "page_h": page_height,
+            "left_pct": round((left / max(page_width, 1)) * 100, 2),
+            "top_pct": round((top / max(page_height, 1)) * 100, 2),
+            "width_pct": round((width / max(page_width, 1)) * 100, 2),
+            "height_pct": round((height / max(page_height, 1)) * 100, 2),
+            "confidence": confidence,
+            "query_text": query_text,
+            "patch_count": int(len(top_patch_indices)),
+            "grid_cols": grid_cols,
+            "grid_rows": grid_rows,
+        }
+
+    def build_crop_regions_for_results(
+        self,
+        results: List[Dict[str, Any]],
+        fallback_query_text: str,
+    ) -> Dict[str, Any]:
+        """为最终采用的 evidence 生成粗粒度 Patch 高亮框。"""
+        if not PATCH_HIGHLIGHT_ENABLED or not results:
+            return {"regions": {}, "count": 0, "timing_ms": 0.0}
+
+        start = time.perf_counter()
+        query_embedding_cache: Dict[str, np.ndarray] = {}
+        crop_regions: Dict[tuple, Dict[str, Any]] = {}
+
+        for result in results[:PATCH_HIGHLIGHT_TOP_N]:
+            score = float(result.get("score", 0.0))
+            if score < PATCH_HIGHLIGHT_MIN_SCORE:
+                continue
+
+            document_id = str(result.get("document_id", ""))
+            page_number = int(result.get("page_number", 0) or 0)
+            image_path = str(result.get("image_path", ""))
+            if not document_id or page_number <= 0 or not image_path:
+                continue
+
+            matched_queries = [str(item).strip() for item in result.get("matched_sub_queries", []) if str(item).strip()]
+            highlight_query = matched_queries[0] if matched_queries else fallback_query_text.strip()
+            if not highlight_query:
+                continue
+
+            if highlight_query not in query_embedding_cache:
+                query_embedding_cache[highlight_query] = self._encode_query_tokens(highlight_query)
+
+            document_embeddings = self._load_original_vectors_for_page(document_id=document_id, page_number=page_number)
+            if document_embeddings is None:
+                continue
+
+            crop_region = self._compute_crop_region_from_embeddings(
+                query_embeddings=query_embedding_cache[highlight_query],
+                document_embeddings=document_embeddings,
+                image_path=image_path,
+                query_text=highlight_query,
+            )
+            if crop_region:
+                crop_regions[(document_id, page_number)] = crop_region
+
+        return {
+            "regions": crop_regions,
+            "count": len(crop_regions),
+            "timing_ms": round((time.perf_counter() - start) * 1000, 2),
+        }
+
     def retrieve_with_two_stage(
         self,
         query_text: str,
@@ -356,60 +657,66 @@ class VisionVectorStore:
         document_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        用户输入问题时，通过 ColPali 获取 Text Embedding，
-        利用 Qdrant 第一级 "muvera_fde" 扩大召回返回大基数侯选人（Prefetch），
-        随后第二级即利用 "original" 多向量通过 Max-Sim 的运算执行精准重排（Rerank）。
-        这就是多模态检索提速 10x 以上的 RAG 核心技巧。
+        执行两阶段检索。
+
+        查询阶段的核心策略是：
+        1. 先把用户问题编码成 ColPali 查询多向量，再额外生成一份 MUVERA 压缩表示。
+        2. 第一阶段用 `muvera_fde` 在全库中快速召回较大的候选集。
+        3. 第二阶段只在候选集上用 `original` 原始多向量做精排。
+
+        这样既能保住较高检索质量，又避免每次都拿原始多向量去扫全库。
         
         参数:
             query_text (str): 用户的原始中文/英文问题。
             top_k (int): 最终向 GPT 提供的置信度最高的 Top 页数。
             prefetch_multiplier (int): 第一阶段召回的扩大系数，通常 5 到 10 即可。
             
-        返回:
-            List[Tuple[image_path, score]]: 匹配度排名前 k 的包含路径列表与权重的二元组。
+        返回值里既包含整理后的结果，也包含这一轮检索各阶段的耗时指标。
         """
         total_start = time.perf_counter()
 
-        # 第一步：计算用户查询的问题向量
+        # 先把文本问题编码成 ColPali 查询向量。
         query_embedding_start = time.perf_counter()
         batch_queries = self.processor.process_queries([query_text]).to(self.device)
         with torch.no_grad():
-            # 同样输出高维度的 128D Multi-vector
+            # 查询侧输出同样是多向量，而不是单个句向量。
             query_embedding_tensor = self.model(**batch_queries)[0]
         
         query_colpali = query_embedding_tensor.float().cpu().numpy()
-        # 同样生成问题的 MUVERA 压缩版以便和图片 MUVERA 比对
+        # 再派生一份压缩版查询向量，供第一阶段粗召回使用。
         query_muvera = self.muvera.process_query(query_colpali)
 
-        # 同样执行防御性维度重塑 (Defensive Reshape)，防止一维铺平错误
+        # 和文档侧一样，查询侧也显式重塑成二维，确保每行代表一个 token 向量。
         query_colpali_2d = query_colpali.reshape(-1, 128)
         query_muvera_2d = query_muvera.reshape(-1, 16)
         query_embedding_ms = (time.perf_counter() - query_embedding_start) * 1000
-        # 归一化因子：查询 token 数量，使分数落入 [0, 1] 区间，消除查询长度对阈值的影响
+        # 查询越长，参与匹配的 query token 往往越多；这里按 token 数做归一化，
+        # 是为了让不同长度问题的分数更可比，便于统一使用 min_score 阈值。
         n_query_tokens = max(query_colpali_2d.shape[0], 1)
 
         query_filter = self._build_document_filter(document_ids)
 
-        # 第二步：单次 API 请求完成"海选"加"优选"
+        # 一次 query_points 调用里同时完成粗召回和精排：
+        # - prefetch: 使用压缩向量从全库召回更大的候选集。
+        # - query:    使用原始多向量只对候选集做精排。
         qdrant_query_start = time.perf_counter()
         results = self.qdrant.query_points(
             collection_name=COLLECTION_NAME,
             prefetch=[
                 models.Prefetch(
                     query=query_muvera_2d.tolist(),
-                    using="muvera_fde",      # 用压缩版做海量打分过滤
+                    using="muvera_fde",      # 用压缩向量先做第一阶段粗召回。
                     limit=top_k * prefetch_multiplier,
                 )
             ],
             query=query_colpali_2d.tolist(),
-            using="original",                # 从上面过滤出的一小部分数据里做精确计算 (MaxSim 距离)
+            using="original",                # 只在候选集上做高精度多向量匹配。
             limit=top_k,
             query_filter=query_filter,
         )
         qdrant_query_ms = (time.perf_counter() - qdrant_query_start) * 1000
 
-        # 对结果进行去重，避免 1 页文档重复返回多次相同证据页。
+        # Qdrant 返回的是点级结果；这里进一步做页面级去重，避免同一页重复入选。
         result_format_start = time.perf_counter()
         unique = []
         seen = set()
