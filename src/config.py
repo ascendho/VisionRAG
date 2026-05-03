@@ -51,12 +51,6 @@ QUERY_REWRITE_MAX_HISTORY_MESSAGES = int(os.getenv("QUERY_REWRITE_MAX_HISTORY_ME
 QUERY_REWRITE_TIMEOUT_MS = int(os.getenv("QUERY_REWRITE_TIMEOUT_MS", "2500"))
 QUERY_REWRITE_TRIGGER_MAX_CHARS = int(os.getenv("QUERY_REWRITE_TRIGGER_MAX_CHARS", "48"))
 
-# Patch 高亮配置。
-# 第一版只做对最终采用证据页的粗粒度红框高亮，因此限制默认保持保守。
-PATCH_HIGHLIGHT_ENABLED = os.getenv("PATCH_HIGHLIGHT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-PATCH_HIGHLIGHT_TOP_N = int(os.getenv("PATCH_HIGHLIGHT_TOP_N", "3"))
-PATCH_HIGHLIGHT_MIN_SCORE = float(os.getenv("PATCH_HIGHLIGHT_MIN_SCORE", "0.6"))
-
 # 文档页图片缓存目录。
 # 所有 PDF / 图片 / 文本在进入向量化之前，都会先被标准化为页面图片并缓存在这里。
 # 之所以放到系统临时目录，而不是项目目录，是为了避免 `uvicorn --reload`

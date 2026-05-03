@@ -124,6 +124,52 @@ def _filter_results_by_min_score(results: List[Dict[str, Any]], min_score: float
     return [dict(item) for item in results if float(item.get("score", 0.0)) >= min_score]
 
 
+def _select_results_with_threshold_fallback(
+    results: List[Dict[str, Any]],
+    min_score: float,
+    fallback_limit: int = 1,
+) -> Dict[str, Any]:
+    strict_results = _filter_results_by_min_score(results, min_score)
+    if strict_results:
+        prepared_results = []
+        for item in strict_results:
+            cloned = dict(item)
+            cloned["fallback_below_threshold"] = False
+            cloned["fallback_source_score"] = float(cloned.get("score", 0.0))
+            cloned["fallback_reason"] = ""
+            prepared_results.append(cloned)
+        return {
+            "selected_results": prepared_results,
+            "fallback_used": False,
+            "fallback_count": 0,
+            "fallback_best_score": 0.0,
+        }
+
+    if not results:
+        return {
+            "selected_results": [],
+            "fallback_used": False,
+            "fallback_count": 0,
+            "fallback_best_score": 0.0,
+        }
+
+    promoted_results: List[Dict[str, Any]] = []
+    for item in results[:max(1, int(fallback_limit))]:
+        cloned = dict(item)
+        source_score = float(cloned.get("score", 0.0))
+        cloned["fallback_below_threshold"] = True
+        cloned["fallback_source_score"] = source_score
+        cloned["fallback_reason"] = f"best_available_below_threshold<{min_score:.2f}"
+        promoted_results.append(cloned)
+
+    return {
+        "selected_results": promoted_results,
+        "fallback_used": True,
+        "fallback_count": len(promoted_results),
+        "fallback_best_score": round(float(promoted_results[0].get("score", 0.0)), 2),
+    }
+
+
 def _best_result_score(results: List[Dict[str, Any]]) -> float:
     if not results:
         return 0.0
@@ -495,7 +541,8 @@ def _retrieve_compound_aware(
             top_k=top_k,
         )
         results = retrieval_payload["results"]
-        selected_results = _filter_results_by_min_score(results, min_score)
+        selection_meta = _select_results_with_threshold_fallback(results, min_score)
+        selected_results = selection_meta["selected_results"]
         sub_query_text = sub_queries[0] if sub_queries else retrieval_query_text
         return {
             "sub_queries": sub_queries or [query_text],
@@ -503,12 +550,23 @@ def _retrieve_compound_aware(
             "results": results,
             "selected_results": selected_results,
             "unsupported_sub_queries": [] if selected_results else ([sub_query_text] if sub_query_text else []),
+            "fallback_details": [
+                {
+                    "query": sub_query_text,
+                    "retrieval_query": retrieval_query_text,
+                    "fallback_used": bool(selection_meta.get("fallback_used")),
+                    "fallback_count": int(selection_meta.get("fallback_count") or 0),
+                    "fallback_best_score": float(selection_meta.get("fallback_best_score") or 0.0),
+                }
+            ] if sub_query_text else [],
             "sub_query_support": [
                 {
                     "query": sub_query_text,
                     "retrieval_query": retrieval_query_text,
                     "best_score": _best_result_score(results),
                     "selected_count": len(selected_results),
+                    "fallback_used": bool(selection_meta.get("fallback_used")),
+                    "fallback_best_score": float(selection_meta.get("fallback_best_score") or 0.0),
                 }
             ] if sub_query_text else [],
             "timing": retrieval_payload["timing"],
@@ -523,6 +581,7 @@ def _retrieve_compound_aware(
     sub_query_timings: List[Dict[str, Any]] = []
     unsupported_sub_queries: List[str] = []
     sub_query_support: List[Dict[str, Any]] = []
+    fallback_details: List[Dict[str, Any]] = []
 
     for sub_query, retrieval_query in zip(sub_queries, normalized_retrieval_queries):
         retrieval_payload = vector_store_instance.retrieve_with_two_stage(
@@ -531,18 +590,30 @@ def _retrieve_compound_aware(
             top_k=per_sub_query_top_k,
         )
         raw_results = retrieval_payload["results"]
-        selected_results = _filter_results_by_min_score(raw_results, min_score)
+        selection_meta = _select_results_with_threshold_fallback(raw_results, min_score)
+        selected_results = selection_meta["selected_results"]
         raw_result_groups.append(raw_results)
         selected_result_groups.append(selected_results)
         sub_query_timings.append(retrieval_payload["timing"])
         if not selected_results:
             unsupported_sub_queries.append(sub_query)
+        fallback_details.append(
+            {
+                "query": sub_query,
+                "retrieval_query": retrieval_query,
+                "fallback_used": bool(selection_meta.get("fallback_used")),
+                "fallback_count": int(selection_meta.get("fallback_count") or 0),
+                "fallback_best_score": float(selection_meta.get("fallback_best_score") or 0.0),
+            }
+        )
         sub_query_support.append(
             {
                 "query": sub_query,
                 "retrieval_query": retrieval_query,
                 "best_score": _best_result_score(raw_results),
                 "selected_count": len(selected_results),
+                "fallback_used": bool(selection_meta.get("fallback_used")),
+                "fallback_best_score": float(selection_meta.get("fallback_best_score") or 0.0),
             }
         )
 
@@ -555,6 +626,7 @@ def _retrieve_compound_aware(
         "results": merged_results,
         "selected_results": merged_selected_results,
         "unsupported_sub_queries": unsupported_sub_queries,
+        "fallback_details": fallback_details,
         "sub_query_support": sub_query_support,
         "timing": _aggregate_compound_retrieval_timing(sub_queries, normalized_retrieval_queries, sub_query_timings, len(merged_results)),
     }
@@ -835,6 +907,7 @@ async def chat(request: Request, req: ChatRequest):
     compound_split_allowed = len(original_sub_queries) > 1
     sub_queries = original_sub_queries or [req.query]
     unsupported_sub_queries: List[str] = []
+    fallback_details: List[Dict[str, Any]] = []
     rewrite_meta: Dict[str, Any] = dict(query_plan.get("rewrite_meta") or {
         "applied": False,
         "rewritten_query": req.query,
@@ -860,7 +933,17 @@ async def chat(request: Request, req: ChatRequest):
         results = retrieval_payload["results"]
         score_filtered = retrieval_payload["selected_results"]
         unsupported_sub_queries = list(retrieval_payload.get("unsupported_sub_queries") or [])
+        fallback_details = list(retrieval_payload.get("fallback_details") or [])
         retrieval_timing = retrieval_payload["timing"]
+        fallback_sub_queries = [
+            str(item.get("query") or "").strip()
+            for item in fallback_details
+            if bool(item.get("fallback_used")) and str(item.get("query") or "").strip()
+        ]
+        fallback_best_score = max(
+            (float(item.get("fallback_best_score") or 0.0) for item in fallback_details if bool(item.get("fallback_used"))),
+            default=0.0,
+        )
         retrieval_timing.update(
             {
                 "rewrite_applied": bool(rewrite_meta.get("applied")),
@@ -875,6 +958,11 @@ async def chat(request: Request, req: ChatRequest):
                 "compound_split_applied": compound_split_allowed,
                 "compound_split_source": "original_query",
                 "min_score_applied": float(req.min_score),
+                "fallback_evidence_used": bool(fallback_sub_queries),
+                "fallback_evidence_count": len(fallback_sub_queries),
+                "fallback_best_score": round(fallback_best_score, 2),
+                "fallback_sub_queries": fallback_sub_queries,
+                "fallback_details": fallback_details,
                 "unsupported_sub_query_count": len(unsupported_sub_queries),
                 "unsupported_sub_queries": unsupported_sub_queries,
                 "sub_query_support": list(retrieval_payload.get("sub_query_support") or []),
@@ -911,16 +999,9 @@ async def chat(request: Request, req: ChatRequest):
     reused_supported_sub_queries = list(reuse_support_meta.get("reused_supported_sub_queries") or [])
     evidence_images = [r["image_path"] for r in valid_results if r.get("image_path")]
     confidence = _build_confidence_summary(valid_results)
-    crop_highlight_payload = vector_store_instance.build_crop_regions_for_results(
-        results=valid_results,
-        fallback_query_text=retrieval_query,
-    ) if (not pre_guard and valid_results) else {"regions": {}, "count": 0, "timing_ms": 0.0}
-    crop_regions = crop_highlight_payload.get("regions", {})
     if retrieval_timing is not None:
         retrieval_timing.update(
             {
-                "crop_highlight_ms": float(crop_highlight_payload.get("timing_ms") or 0.0),
-                "crop_highlight_count": int(crop_highlight_payload.get("count") or 0),
                 "direct_unsupported_sub_queries": direct_unsupported_sub_queries,
                 "unsupported_sub_queries": unsupported_sub_queries,
                 "unsupported_sub_query_count": len(unsupported_sub_queries),
@@ -952,6 +1033,9 @@ async def chat(request: Request, req: ChatRequest):
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
+            "fallback_below_threshold": bool(r.get("fallback_below_threshold")),
+            "fallback_source_score": float(r.get("fallback_source_score", r.get("score", 0.0))),
+            "fallback_reason": str(r.get("fallback_reason") or ""),
             "matched_sub_queries": direct_supported_sub_queries,
             "direct_supported_sub_queries": direct_supported_sub_queries,
             "reused_supported_sub_queries": reused_supported_sub_queries,
@@ -962,10 +1046,12 @@ async def chat(request: Request, req: ChatRequest):
             "document_name": r.get("document_name", "Unknown File"),
             "page_number": r.get("page_number", 0),
             "score": float(r.get("score", 0.0)),
+            "fallback_below_threshold": bool(r.get("fallback_below_threshold")),
+            "fallback_source_score": float(r.get("fallback_source_score", r.get("score", 0.0))),
+            "fallback_reason": str(r.get("fallback_reason") or ""),
             "image_base64": image_path_to_base64(image_path),
             "matched_sub_queries": direct_supported_sub_queries,
             "reused_supported_sub_queries": reused_supported_sub_queries,
-            "crop_region": crop_regions.get(key),
         })
 
     # 全部候选页（top_k 个，含未被 min_score 采用的），供前端展示所有得分
@@ -986,7 +1072,6 @@ async def chat(request: Request, req: ChatRequest):
             "score": score,
             "image_base64": image_path_to_base64(image_path),
             "matched_sub_queries": list(r.get("matched_sub_queries", [])),
-            "crop_region": crop_regions.get(key),
             "is_used": key in used_keys,
             "unused_reason": unused_reason,
         })

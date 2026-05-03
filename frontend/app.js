@@ -20,8 +20,8 @@ const activeChat = {
   stopRequested: false,
 };
 const SEND_BUTTON_HTML = `<svg class="w-5 h-5 mx-auto" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>`;
-const STOP_BUTTON_HTML = `<svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"></rect></svg><span class="text-[13px] font-semibold leading-none">停止</span>`;
-const STOPPING_BUTTON_HTML = `<div class="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin"></div><span class="text-[13px] font-semibold leading-none">停止中</span>`;
+const STOP_BUTTON_HTML = `<svg class="w-5 h-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.5"></rect></svg><span class="text-[13px] font-semibold leading-none">停止</span>`;
+const STOPPING_BUTTON_HTML = `<div class="w-5 h-5 border-2 border-current border-t-transparent rounded-full animate-spin"></div><span class="text-[13px] font-semibold leading-none">停止中</span>`;
 
 // Elements
 const bottomFileInput = document.getElementById('bottomFileInput');
@@ -1174,33 +1174,6 @@ function addUserMessage(text) {
   scrollToBottom();
 }
 
-function buildEvidenceCropOverlayMarkup(cropRegion) {
-  if (!cropRegion) return '';
-
-  const leftPct = Math.max(0, Math.min(100, Number(cropRegion.left_pct)));
-  const topPct = Math.max(0, Math.min(100, Number(cropRegion.top_pct)));
-  const widthPct = Math.max(0, Math.min(100 - leftPct, Number(cropRegion.width_pct)));
-  const heightPct = Math.max(0, Math.min(100 - topPct, Number(cropRegion.height_pct)));
-  if (!Number.isFinite(leftPct) || !Number.isFinite(topPct) || !Number.isFinite(widthPct) || !Number.isFinite(heightPct)) {
-    return '';
-  }
-  if (widthPct <= 0 || heightPct <= 0) return '';
-
-  const alpha = Math.max(0.18, Math.min(0.38, Number(cropRegion.confidence || 0.24)));
-  const title = cropRegion.query_text
-    ? `高亮命中区域 · ${escapeHtml(cropRegion.query_text)}`
-    : '高亮命中区域';
-
-  return `<div class="evidence-crop-overlay" style="left:${leftPct}%;top:${topPct}%;width:${widthPct}%;height:${heightPct}%;--crop-alpha:${alpha.toFixed(2)};" title="${title}"></div>`;
-}
-
-function buildMatchedSubQueryMarkup(matchedSubQueries = []) {
-  const firstMatchedQuery = (matchedSubQueries || []).find((item) => String(item || '').trim());
-  if (!firstMatchedQuery) return '';
-  const escapedQuery = escapeHtml(String(firstMatchedQuery).trim());
-  return `<p class="evidence-subquery" title="${escapedQuery}">命中：${escapedQuery}</p>`;
-}
-
 function _buildEvidenceCards(msgId, evidences, allCandidates) {
   const formalEvidences = Array.isArray(evidences) ? evidences : [];
   const allCandidatePages = Array.isArray(allCandidates) ? allCandidates : [];
@@ -1209,8 +1182,6 @@ function _buildEvidenceCards(msgId, evidences, allCandidates) {
 
   const cards = formalEvidences.map(ev => {
     const imgSrc = ev.image_base64.startsWith('data:') ? ev.image_base64 : `data:image/jpeg;base64,${ev.image_base64}`;
-    const cropOverlay = buildEvidenceCropOverlayMarkup(ev.crop_region);
-    const matchedSubQuery = buildMatchedSubQueryMarkup(ev.matched_sub_queries);
     const evidenceBadge = ev.evidence_id
       ? `<span class="evidence-chip">${ev.evidence_id}</span>`
       : '';
@@ -1221,7 +1192,6 @@ function _buildEvidenceCards(msgId, evidences, allCandidates) {
       <div ${evidenceAttrs} class="evidence-card w-full bg-white dark:bg-slate-800 border border-[#e2e8f0] dark:border-slate-700 rounded-2xl overflow-hidden shadow-sm cursor-pointer hover:shadow-md transition-all group" onclick="openImageModal('${imgSrc}')">
         <div class="relative bg-[#f0f4f9] dark:bg-slate-900" style="aspect-ratio: 4/3;">
           <img src="${imgSrc}" class="w-full h-full object-fill group-hover:scale-[1.015] transition-transform duration-300">
-          ${cropOverlay}
           <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 dark:group-hover:bg-white/10 transition-colors flex items-center justify-center">
             <svg class="w-6 h-6 text-white opacity-0 group-hover:opacity-100 transition-opacity drop-shadow-md" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
           </div>
@@ -1230,7 +1200,6 @@ function _buildEvidenceCards(msgId, evidences, allCandidates) {
         <div class="p-2.5">
           <h4 class="text-[13px] font-medium text-[#1f1f1f] dark:text-slate-200 line-clamp-1">${ev.document_name}</h4>
           <p class="text-[11px] text-[#80868b] dark:text-slate-400 mt-0.5">Page ${ev.page_number} · ${ev.score.toFixed(2)}</p>
-          ${matchedSubQuery}
         </div>
       </div>`;
   }).join('');

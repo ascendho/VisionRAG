@@ -86,7 +86,8 @@ def _build_system_prompt() -> str:
         "7. 不要声称看过未提供的页面，也不要编造证据编号、页码、文档名或引用。\n"
         "8. 输出尽量使用以下结构中的适用部分：`结论`、`依据`、`不确定点`。\n"
         "9. 如果用户问题包含多个独立子问题，必须逐项回答每一项，不要只回答其中一部分。\n"
-        "10. 对证据不足的子问题，要单独写明“根据当前证据无法确认”，不要让一个子问题的证据结论替代另一个子问题。"
+        "10. 对证据不足的子问题，要单独写明“根据当前证据无法确认”，不要让一个子问题的证据结论替代另一个子问题。\n"
+        "11. 如果某条证据被标记为低于采用阈值的回退证据，说明它是当前最相关但置信度较低的候选。你可以引用它，但必须明确使用谨慎表述，不能把它写成完全确定的事实。"
     )
 
 
@@ -108,11 +109,18 @@ def _format_evidence_context(evidence_context: List[dict] | None = None) -> str:
         score = item.get("score")
         direct_supported_sub_queries = item.get("direct_supported_sub_queries") or item.get("matched_sub_queries") or []
         reused_supported_sub_queries = item.get("reused_supported_sub_queries") or []
+        fallback_below_threshold = bool(item.get("fallback_below_threshold"))
+        fallback_source_score = item.get("fallback_source_score")
         if isinstance(score, (float, int)):
             line = f"[{evidence_id}] 文档：{document_name}；页码：{page_number}；相关性分数：{score:.2f}"
         else:
             line = f"[{evidence_id}] 文档：{document_name}；页码：{page_number}"
 
+        if fallback_below_threshold:
+            if isinstance(fallback_source_score, (float, int)):
+                line += f"；证据状态：低置信回退（原始分数：{float(fallback_source_score):.2f}）"
+            else:
+                line += "；证据状态：低置信回退"
         if direct_supported_sub_queries:
             line += f"；直接支持：{' / '.join(direct_supported_sub_queries)}"
         if reused_supported_sub_queries:
@@ -149,6 +157,9 @@ def _build_turn_sections(
         sections.append("以下子问题当前仍然缺少可用的正式证据支持：")
         sections.extend([f"- {sub_query}" for sub_query in unsupported_sub_queries])
         sections.append("对这些子问题必须逐项写“根据当前证据无法确认”，不要借用其他子问题的证据替代回答。")
+
+    if evidence_context and any(bool(item.get("fallback_below_threshold")) for item in evidence_context):
+        sections.append("本轮包含低于采用阈值但当前最相关的回退证据。你可以参考这些证据作答，但必须明确保持谨慎措辞，不要把低置信候选写成完全确定的结论。")
 
     evidence_text = _format_evidence_context(evidence_context)
     if evidence_text:
