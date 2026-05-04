@@ -4,6 +4,8 @@
 
 # 多模态 RAG 业务本地缓存与数据库（避免将几百 MB 的图片特征与原始数据提交）
 cache_images/
+data/qdrant/
+data/eval_runs/
 qdrant_local/
 eval_runs/
 benchmarks/_validate_*

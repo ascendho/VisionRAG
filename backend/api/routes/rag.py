@@ -20,7 +20,7 @@ from src.doc_processor import (
     process_text_to_images,
 )
 from src.llm_generator import generate_answer_stream, generate_suggested_questions
-from src.config import DEFAULT_MIN_SCORE, QUERY_GUARD_ENABLED
+from src.config import DEFAULT_MIN_SCORE, QUERY_GUARD_ENABLED, UPLOADED_FILES_DIR
 from src.query_rewriter import rewrite_query_with_context
 
 router = APIRouter()
@@ -729,10 +729,8 @@ def _rebuild_image_cache_if_needed(results: list) -> None:
     if not missing_doc_ids:
         return
 
-    # 目录名继续沿用 pdfs 以兼容已有持久化数据，实际存放的是所有原始上传文件。
-    stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
     for doc_id, doc_name in missing_doc_ids.items():
-        matches = glob.glob(os.path.join(stored_files_dir, f"{doc_id}_*"))
+        matches = glob.glob(os.path.join(UPLOADED_FILES_DIR, f"{doc_id}_*"))
         file_path = matches[0] if matches else None
         if not file_path or not os.path.exists(file_path):
             print(f"[Warning] File not found for document '{doc_name}' ({doc_id}), cannot rebuild image cache.")
@@ -757,8 +755,7 @@ def download_file(document_id: str):
     """
     Download the original uploaded file.
     """
-    stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-    matches = glob.glob(os.path.join(stored_files_dir, f"{document_id}_*"))
+    matches = glob.glob(os.path.join(UPLOADED_FILES_DIR, f"{document_id}_*"))
     
     file_path = matches[0] if matches else None
         
@@ -811,8 +808,7 @@ def delete_file(document_id: str):
     try:
         vector_store_instance.delete_document(document_id)
         
-        stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-        for m in glob.glob(os.path.join(stored_files_dir, f"{document_id}_*")):
+        for m in glob.glob(os.path.join(UPLOADED_FILES_DIR, f"{document_id}_*")):
             os.remove(m)
             
         return {"status": "success", "message": f"Document {document_id} deleted successfully"}
@@ -955,9 +951,8 @@ def _run_upload_job(task_id: str, temp_path: str, original_filename: str, suffix
 
         safe_filename = (original_filename or os.path.basename(temp_path) or "uploaded_file")
         safe_filename = safe_filename.replace("/", "_").replace("\\", "_").replace(" ", "_")
-        stored_files_dir = os.path.join(os.getcwd(), "qdrant_local", "pdfs")
-        os.makedirs(stored_files_dir, exist_ok=True)
-        final_file_path = os.path.join(stored_files_dir, f"{document_id}_{safe_filename}")
+        os.makedirs(UPLOADED_FILES_DIR, exist_ok=True)
+        final_file_path = os.path.join(UPLOADED_FILES_DIR, f"{document_id}_{safe_filename}")
         shutil.copy(temp_path, final_file_path)
 
         _update_upload_job(

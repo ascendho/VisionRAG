@@ -32,21 +32,36 @@
 
 ```text
 RAG/
-├── requirements.txt
-├── src/                           # AI 核心逻辑
-│   ├── config.py                  # 环境变量（API Key、模型名、Qdrant URL 等）
-│   ├── llm_generator.py           # 调用豆包视觉 LLM 生成答案
-│   ├── doc_processor.py            # 视觉文档 → 页面图像缓存（PDF/图片/PPTX）
-│   └── vector_store.py            # ColPali + MUVERA + Qdrant 封装
 ├── backend/                       # FastAPI 后端
 │   ├── main.py                    # 应用入口，挂载静态前端
 │   └── api/routes/
 │       ├── health.py              # 健康检查
 │       └── rag.py                 # 上传、对话、文件管理接口
-└── frontend/                      # 前端客户端
-    ├── index.html                 # 单页 HTML（Tailwind 样式）
-    └── app.js                     # 所有交互逻辑
+├── benchmarks/                    # benchmark 定义与样本文档
+│   ├── README.md
+│   ├── rag_eval_small_draft.json
+│   └── sample-documents/
+├── data/                          # 本地运行产物（默认忽略）
+│   ├── eval_runs/                 # 评测结果输出
+│   └── qdrant/                    # embedded Qdrant 数据与原始上传文件
+├── frontend/                      # 前端客户端
+│   ├── index.html                 # 单页 HTML（Tailwind 样式）
+│   └── app.js                     # 所有交互逻辑
+├── scripts/                       # benchmark 起草与评测脚本
+│   ├── bootstrap_rag_benchmark.py
+│   └── run_rag_eval.py
+├── src/                           # AI 核心逻辑
+│   ├── config.py                  # 环境变量、运行目录与模型配置
+│   ├── llm_generator.py           # 调用豆包视觉 LLM 生成答案
+│   ├── doc_processor.py           # 视觉文档 → 页面图像缓存（PDF/图片/PPTX）
+│   └── vector_store.py            # ColPali + MUVERA + Qdrant 封装
+├── tests/                         # 回归测试
+├── assets/                        # README 配图等静态资源
+├── README.md
+└── requirements.txt
 ```
+
+从这一版开始，仓库会把持久化运行数据统一放到 `data/` 下；如果根目录里还残留旧的 `qdrant_local/` 或 `eval_runs/`，首次运行配置或评测脚本时会自动迁移到新位置。
 
 ## 🚀 快速启动
 
@@ -81,11 +96,11 @@ COLLECTION_NAME=colpali-rag-collection
 
 ```bash
 docker run -p 6333:6333 -p 6334:6334 \
-    -v $(pwd)/qdrant_local:/qdrant/storage:z \
+    -v $(pwd)/data/qdrant:/qdrant/storage:z \
     qdrant/qdrant
 ```
 
-推荐把 Docker 版 Qdrant 作为默认运行路径。若 `QDRANT_URL` 不可达，后端会自动回退到仓库内的 `qdrant_local/` embedded 存储，方便本地开发或离线调试；但做 benchmark 时，建议先确认当前实例实际连接的是 Docker 暴露的 6333 端口。
+推荐把 Docker 版 Qdrant 作为默认运行路径。若 `QDRANT_URL` 不可达，后端会自动回退到仓库内的 `data/qdrant/` embedded 存储，方便本地开发或离线调试；但做 benchmark 时，建议先确认当前实例实际连接的是 Docker 暴露的 6333 端口。
 
 ### 4. 运行服务
 
@@ -194,7 +209,7 @@ python scripts/bootstrap_rag_benchmark.py \
 python scripts/run_rag_eval.py \
     --benchmark-file benchmarks/rag_eval_small_draft.json \
     --api-base-url http://127.0.0.1:8000 \
-    --output-dir eval_runs/first_pass
+    --output-dir data/eval_runs/first_pass
 ```
 
 脚本会输出：
@@ -210,9 +225,30 @@ python scripts/run_rag_eval.py \
 如果你已经手工补完 `review_sheet.csv`，可以单独做一次人工评分汇总：
 
 ```bash
-python scripts/run_rag_eval.py --review-csv eval_runs/first_pass/review_sheet.csv
+python scripts/run_rag_eval.py --review-csv data/eval_runs/first_pass/review_sheet.csv
 ```
 
 `bootstrap_rag_benchmark.py` 会优先尝试基于单页文本自动生成“问题 + gold answer + gold page”的草稿；如果当前环境没有可用的大模型 key，也会退回到启发式模式，至少先帮你把文档页码、标题/重点句和 review CSV 搭起来，避免全量手工抄题。
 
 第一版会自动统计：raw/final page Hit@1、Hit@3、MRR、doc Hit@K、fallback 使用率、unsupported sub-query 数、retrieval latency、首 token 延迟、keyword coverage、citation 是否命中 gold evidence。对于更可信的答案质量结论，仍建议结合人工评分结果一起使用。
+
+### 当前 20 题 benchmark 结果
+
+当前正式 benchmark 为 20 题，覆盖 3 份真实 PDF / PPTX 文档。最近一轮结果保存在 `data/eval_runs/rag_eval_small_draft_run_20q/summary.json`，其中：
+
+- `final_page_hit_at_3 = 0.90`
+- `final_page_mrr = 0.7667`
+- `citation_has_gold_evidence_rate = 0.90`
+- `answer_contains_gold_answer_rate = 0.85`
+- `keyword_coverage_avg = 0.95`
+- `fallback_rate = 0.50`
+
+这组数字属于自动 benchmark 指标，不是人工复核分数。当前 20 题 run 还没有补完人工评分；已经完成人工复核的是 earlier 10 题 reviewed subset，对应 `manual_answer_accuracy_avg = 1.0`、`manual_faithfulness_avg = 1.0`、`manual_citation_correctness_avg = 0.95`。
+
+### 简历 / 项目介绍表述参考
+
+中文：实现基于 ColPali、MUVERA 与 Qdrant 的多模态视觉 RAG 系统，支持 PDF / PPTX 文档问答、页面级证据回溯与复合问题检索；搭建并扩展到 20 题、覆盖 3 份真实文档的 benchmark，在最新自动评测中取得 90% final page Hit@3、0.7667 final page MRR、90% 引用命中 gold evidence。
+
+English: Built a multimodal visual RAG system on top of ColPali, MUVERA, and Qdrant for PDF/PPTX question answering with page-level evidence grounding and compound-query retrieval; expanded the benchmark to 20 questions across 3 real documents and achieved 90% final page Hit@3, 0.7667 final page MRR, and 90% citation-to-gold-evidence match in the latest automated evaluation.
+
+如果你想把人工复核结论也写进去，建议单独注明样本范围，例如：在 earlier reviewed 10-question subset 上，manual answer accuracy 和 faithfulness 均为 1.0，manual citation correctness 为 0.95。这样不会把 10 题人工结果误说成 20 题人工结果。

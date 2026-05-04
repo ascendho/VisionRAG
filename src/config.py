@@ -11,6 +11,7 @@
 """
 
 import os
+import shutil
 import tempfile
 from dotenv import load_dotenv
 
@@ -21,15 +22,39 @@ load_dotenv()
 # 这里允许通过国内镜像源减少网络不稳定带来的下载失败，尤其适合本地开发环境。
 os.environ["HF_ENDPOINT"] = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+
+
+def _resolve_runtime_dir(env_key: str, default_relative_path: str, *, legacy_relative_path: str | None = None) -> str:
+	configured_path = os.getenv(env_key)
+	resolved_path = os.path.abspath(configured_path) if configured_path else os.path.join(PROJECT_ROOT, default_relative_path)
+
+	if legacy_relative_path and not configured_path:
+		legacy_path = os.path.join(PROJECT_ROOT, legacy_relative_path)
+		if os.path.exists(legacy_path) and not os.path.exists(resolved_path):
+			os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
+			shutil.move(legacy_path, resolved_path)
+
+	os.makedirs(resolved_path, exist_ok=True)
+	return resolved_path
+
+
+DATA_DIR = _resolve_runtime_dir("DATA_DIR", "data")
+
 # Qdrant 是本项目的向量数据库，用来保存每一页文档的多向量表示并执行检索。
 # 默认指向本地 Docker 容器暴露的 6333 端口。
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-# 在本地开发环境里，如果 Docker 版 Qdrant 不可用，就回退到仓库自带的持久化目录。
-QDRANT_PATH = os.getenv(
-	"QDRANT_PATH",
-	os.path.join(os.path.dirname(os.path.dirname(__file__)), "qdrant_local")
+# 在本地开发环境里，如果 Docker 版 Qdrant 不可用，就回退到仓库内的持久化目录。
+QDRANT_PATH = _resolve_runtime_dir("QDRANT_PATH", "data/qdrant", legacy_relative_path="qdrant_local")
+
+# 上传的原始文件和 embedded Qdrant 数据一起落在同一片运行数据目录里，方便统一清理与迁移。
+UPLOADED_FILES_DIR = _resolve_runtime_dir(
+	"UPLOADED_FILES_DIR",
+	os.path.join("data", "qdrant", "pdfs"),
 )
-os.makedirs(QDRANT_PATH, exist_ok=True)
+
+# benchmark 运行结果默认保存在 data/eval_runs，避免仓库根目录持续堆积临时产物。
+EVAL_RUNS_DIR = _resolve_runtime_dir("EVAL_RUNS_DIR", os.path.join("data", "eval_runs"), legacy_relative_path="eval_runs")
 
 # Doubao 是最终负责“看证据页并组织答案”的多模态大模型。
 # 这里保留 API Key 和模型名两个最核心的外部调用参数。

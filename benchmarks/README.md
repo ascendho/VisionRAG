@@ -42,6 +42,21 @@ python scripts/bootstrap_rag_benchmark.py \
 5. 补完 `review_sheet.csv` 里的人工评分列。
 6. 再跑一次 review summary，得到答案准确性、faithfulness、citation correctness 的汇总结果。
 
+## “人工复核草稿” 到底是什么
+
+这里其实有两个不同阶段，容易混在一起：
+
+1. **题目层的人工复核草稿**：指 `bootstrap_rag_benchmark.py` 生成 benchmark 草稿之后，你先人工扫一遍题目质量。
+	- 主要文件：`benchmarks/rag_eval_small_draft.json`、`benchmarks/rag_eval_small_draft_review.csv`
+	- 你要做的事：删掉跨页题、改短标准答案、核对页码和关键词
+	- 目的：把“自动起草的候选题”清洗成“可以正式评测的 benchmark”
+2. **回答层的人工评分表**：指 live evaluation 跑完后，再看模型每题答得对不对、证据稳不稳。
+	- 主要文件：`data/eval_runs/<run_name>/review_sheet.csv`、`review_sheet_reviewed.csv`、`review_summary.json`
+	- 你要做的事：补 `manual_answer_accuracy`、`manual_faithfulness`、`manual_citation_correctness`
+	- 目的：给自动指标之外，再补一层人工质量判断
+
+如果我前面说“人工复核草稿”，默认指的是第一种，也就是 benchmark 题目草稿的轻量人工清洗阶段，不是最终打分表。
+
 ## 产物保留建议
 
 建议把 benchmark 相关产物分成“长期保留”和“临时排查”两类。
@@ -58,9 +73,9 @@ python scripts/bootstrap_rag_benchmark.py \
 - `benchmarks/_validate_bootstrap_review.csv`
 - 每次 run 中的 `detailed_results.json`
 - 尚未补人工评分的 `review_sheet.csv`
-- 只用于冒烟验证的 `eval_runs/smoke_*`
+- 只用于冒烟验证的 `data/eval_runs/smoke_*`
 
-如果你希望仓库长期保持干净，建议只把 benchmark 定义文件纳入版本控制，把 `eval_runs/` 留在本地或单独归档。
+如果你希望仓库长期保持干净，建议只把 benchmark 定义文件纳入版本控制，把 `data/eval_runs/` 留在本地或单独归档。
 
 ## Benchmark 文件结构
 
@@ -115,6 +130,58 @@ python scripts/bootstrap_rag_benchmark.py \
 - retrieval latency、首 token 延迟、整轮对话延迟。
 - `gold_answer_keywords` 的覆盖率。
 - 回答中引用的 evidence 是否命中 gold page。
+
+## 这些指标是怎么算出来的
+
+最容易混淆的是四组概念：
+
+1. **raw vs final**
+	- `raw_*` 看的是 `all_candidates`，也就是精排后的候选页列表。
+	- `final_*` 看的是 `evidences`，也就是阈值筛选与 fallback 之后，真正送进回答生成的页面。
+2. **page vs doc**
+	- `page` 要求页码和文档都匹配。
+	- `doc` 只要求文档匹配，不要求页码一致。
+3. **单题值 vs summary 平均值**
+	- 每一题先算出一个 `0/1` 或一个 MRR 值。
+	- `summary.json` 再对所有题做平均，所以 `0.9` 本质上就是 20 题里有 18 题命中。
+4. **自动指标 vs 人工评分**
+	- `summary.json` 里这些是自动算出来的。
+	- `manual_*` 只有在你补完 review sheet 之后才会出现。
+
+一个最小例子：假设某题的 gold page 是 `waLLMartCache.pdf` 第 2 页，而检索返回：
+
+```text
+all_candidates = [p6, p5, p2]
+evidences      = [p6, p5, p2]
+```
+
+那么：
+
+- `raw_page_hit_at_1 = 0`，因为第 1 名是第 6 页，不是 gold page。
+- `raw_page_hit_at_3 = 1`，因为前 3 个候选里出现了第 2 页。
+- `raw_page_mrr = 1 / 3 = 0.3333`，因为第一个命中的 gold page 出现在第 3 名。
+- 如果 `final` 列表和 `raw` 一样，那么 `final_page_hit_at_3` 和 `final_page_mrr` 也分别是 `1` 和 `0.3333`。
+
+把这个逻辑放大到整份 benchmark：
+
+- 如果 20 题里有 18 题 `final_page_hit_at_3 = 1`，2 题是 `0`，那么 `summary.json` 里的 `final_page_hit_at_3 = 18 / 20 = 0.9`。
+- 如果 20 题里有 10 题 `fallback_evidence_used = 1`，另外 10 题是 `0`，那么 `fallback_rate = 10 / 20 = 0.5`。
+
+回答相关的自动指标再看两步：
+
+1. `answer_contains_gold_answer_rate`
+	- 把回答文本和 `gold_answer` 都做归一化。
+	- 如果标准答案字符串直接出现在回答里，这一题记 `1`，否则记 `0`。
+2. `keyword_coverage_avg`
+	- 看 `gold_answer_keywords` 里有多少关键词真的出现在回答中。
+	- 例如关键词是 `['Redis', 'L2 cache']`，回答只命中了 `Redis`，那这一题 coverage 就是 `1 / 2 = 0.5`。
+
+引用相关指标则是：
+
+- `answer_has_citation_rate`：回答里有没有出现像 `[E3]` 这样的 evidence 引用。
+- `citation_has_gold_evidence_rate`：这些被引用的 evidence 里，是否至少有一个真正命中了 gold page。
+
+所以，当前 20 题结果里的 `final_page_hit_at_3 = 0.9` 可以直译成：20 题里有 90% 的问题，在最终真正用于回答的证据页前 3 名中，包含了正确 gold page。
 
 ## 10 题起步时的题型建议
 

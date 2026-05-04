@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -19,13 +20,27 @@ except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit("requests is required. Install dependencies from requirements.txt first.") from exc
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EVAL_RUNS_DIR = Path(os.getenv("EVAL_RUNS_DIR", str(REPO_ROOT / "data" / "eval_runs")))
+
+
+def ensure_default_eval_runs_dir() -> Path:
+    legacy_eval_runs_dir = REPO_ROOT / "eval_runs"
+    if not DEFAULT_EVAL_RUNS_DIR.exists() and legacy_eval_runs_dir.exists() and legacy_eval_runs_dir != DEFAULT_EVAL_RUNS_DIR:
+        DEFAULT_EVAL_RUNS_DIR.parent.mkdir(parents=True, exist_ok=True)
+        legacy_eval_runs_dir.rename(DEFAULT_EVAL_RUNS_DIR)
+
+    DEFAULT_EVAL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_EVAL_RUNS_DIR
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a small RAG benchmark against the live /api/rag/chat endpoint or summarize a reviewed CSV.",
     )
     parser.add_argument("--benchmark-file", help="Path to the benchmark JSON file.")
     parser.add_argument("--api-base-url", default="http://127.0.0.1:8000", help="Backend base URL.")
-    parser.add_argument("--output-dir", help="Directory for run outputs. Defaults to eval_runs/<timestamp>.")
+    parser.add_argument("--output-dir", help="Directory for run outputs. Defaults to data/eval_runs/<timestamp>.")
     parser.add_argument("--top-k", type=int, help="Override benchmark default top_k.")
     parser.add_argument("--min-score", type=float, help="Override benchmark default min_score.")
     parser.add_argument("--timeout-seconds", type=float, default=180.0, help="Read timeout for each chat request.")
@@ -85,7 +100,7 @@ def build_output_dir(explicit_output_dir: Optional[str]) -> Path:
         output_dir = Path(explicit_output_dir)
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path("eval_runs") / timestamp
+        output_dir = ensure_default_eval_runs_dir() / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
