@@ -73,6 +73,10 @@ DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "3"))
 DEFAULT_MIN_SCORE = float(os.getenv("DEFAULT_MIN_SCORE", "0.6"))
 MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "800"))
 QUERY_GUARD_ENABLED = os.getenv("QUERY_GUARD_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SUPPORTED_RETRIEVAL_MODES = ("two_stage", "colpali_only", "muvera_only")
+DEFAULT_RETRIEVAL_MODE = os.getenv("RETRIEVAL_MODE", "two_stage").strip().lower()
+if DEFAULT_RETRIEVAL_MODE not in SUPPORTED_RETRIEVAL_MODES:
+    DEFAULT_RETRIEVAL_MODE = "two_stage"
 
 # 多轮检索改写配置。
 # 这组参数只影响“送去检索的查询”，不会改写用户在聊天界面里看到的原始问题。

@@ -2,7 +2,7 @@ import asyncio
 from fastapi import APIRouter, BackgroundTasks, File, UploadFile, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 import logging
 import os
 import json
@@ -20,7 +20,7 @@ from src.doc_processor import (
     process_text_to_images,
 )
 from src.llm_generator import generate_answer_stream, generate_suggested_questions
-from src.config import DEFAULT_MIN_SCORE, QUERY_GUARD_ENABLED, UPLOADED_FILES_DIR
+from src.config import DEFAULT_MIN_SCORE, DEFAULT_RETRIEVAL_MODE, QUERY_GUARD_ENABLED, UPLOADED_FILES_DIR
 from src.query_rewriter import rewrite_query_with_context
 
 router = APIRouter()
@@ -33,6 +33,7 @@ class ChatRequest(BaseModel):
     chat_history: Optional[List[dict]] = None
     top_k: int = 5
     min_score: float = DEFAULT_MIN_SCORE
+    retrieval_mode: Literal["two_stage", "colpali_only", "muvera_only"] = DEFAULT_RETRIEVAL_MODE
 
 
 _PRE_RETRIEVAL_GUARD_PATTERNS = [
@@ -531,8 +532,12 @@ def _aggregate_compound_retrieval_timing(
     retrieval_queries: List[str],
     timings: List[Dict[str, Any]],
     returned_points: int,
+    retrieval_mode: str,
 ) -> Dict[str, Any]:
     return {
+        "retrieval_mode": retrieval_mode,
+        "colpali_query_embedding_ms": round(sum(float(item.get("colpali_query_embedding_ms", 0.0)) for item in timings), 2),
+        "muvera_query_embedding_ms": round(sum(float(item.get("muvera_query_embedding_ms", 0.0)) for item in timings), 2),
         "query_embedding_ms": round(sum(float(item.get("query_embedding_ms", 0.0)) for item in timings), 2),
         "qdrant_query_ms": round(sum(float(item.get("qdrant_query_ms", 0.0)) for item in timings), 2),
         "result_format_ms": round(sum(float(item.get("result_format_ms", 0.0)) for item in timings), 2),
@@ -544,6 +549,9 @@ def _aggregate_compound_retrieval_timing(
             {
                 "query": sub_query,
                 "retrieval_query": retrieval_query,
+                "retrieval_mode": retrieval_mode,
+                "colpali_query_embedding_ms": timing.get("colpali_query_embedding_ms", 0.0),
+                "muvera_query_embedding_ms": timing.get("muvera_query_embedding_ms", 0.0),
                 "query_embedding_ms": timing.get("query_embedding_ms", 0.0),
                 "qdrant_query_ms": timing.get("qdrant_query_ms", 0.0),
                 "result_format_ms": timing.get("result_format_ms", 0.0),
@@ -561,6 +569,7 @@ def _retrieve_compound_aware(
     document_ids: Optional[List[str]],
     top_k: int,
     min_score: float,
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
     allow_compound_split: bool = True,
     query_labels: Optional[List[str]] = None,
     retrieval_queries: Optional[List[str]] = None,
@@ -586,6 +595,7 @@ def _retrieve_compound_aware(
             query_text=retrieval_query_text,
             document_ids=document_ids,
             top_k=top_k,
+            retrieval_mode=retrieval_mode,
         )
         results = retrieval_payload["results"]
         selection_meta = _select_results_with_threshold_fallback(
@@ -640,6 +650,7 @@ def _retrieve_compound_aware(
             query_text=retrieval_query,
             document_ids=document_ids,
             top_k=per_sub_query_top_k,
+            retrieval_mode=retrieval_mode,
         )
         raw_results = retrieval_payload["results"]
         selection_meta = _select_results_with_threshold_fallback(
@@ -685,7 +696,13 @@ def _retrieve_compound_aware(
         "unsupported_sub_queries": unsupported_sub_queries,
         "fallback_details": fallback_details,
         "sub_query_support": sub_query_support,
-        "timing": _aggregate_compound_retrieval_timing(sub_queries, normalized_retrieval_queries, sub_query_timings, len(merged_results)),
+        "timing": _aggregate_compound_retrieval_timing(
+            sub_queries,
+            normalized_retrieval_queries,
+            sub_query_timings,
+            len(merged_results),
+            retrieval_mode,
+        ),
     }
 
 
@@ -1243,6 +1260,7 @@ async def chat(request: Request, req: ChatRequest):
             document_ids=req.document_ids,
             top_k=req.top_k,
             min_score=req.min_score,
+            retrieval_mode=req.retrieval_mode,
             allow_compound_split=compound_split_allowed,
             query_labels=original_sub_queries,
             retrieval_queries=retrieval_sub_queries,
@@ -1268,6 +1286,7 @@ async def chat(request: Request, req: ChatRequest):
                 "rewrite_reason": str(rewrite_meta.get("reason") or "unknown"),
                 "rewrite_history_messages": int(rewrite_meta.get("history_messages_used") or 0),
                 "rewrite_model": str(rewrite_meta.get("model") or ""),
+                "retrieval_mode": req.retrieval_mode,
                 "retrieval_query": retrieval_query,
                 "retrieval_sub_queries": retrieval_sub_queries,
                 "sub_query_rewrites": list(rewrite_meta.get("sub_query_rewrites") or []),

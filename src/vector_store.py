@@ -32,8 +32,10 @@ from PIL import Image
 from src.config import (
     COLLECTION_NAME,
     COLPALI_MODEL_NAME,
+    DEFAULT_RETRIEVAL_MODE,
     QDRANT_PATH,
     QDRANT_URL,
+    SUPPORTED_RETRIEVAL_MODES,
 )
 
 logger = logging.getLogger(__name__)
@@ -588,12 +590,56 @@ class VisionVectorStore:
 
         return support_entries
 
+    def _encode_colpali_query(self, query_text: str) -> np.ndarray:
+        batch_queries = self.processor.process_queries([query_text]).to(self.device)
+        with torch.no_grad():
+            query_embedding_tensor = self.model(**batch_queries)[0]
+        return query_embedding_tensor.float().cpu().numpy().reshape(-1, 128)
+
+    def _encode_muvera_query(self, query_colpali_2d: np.ndarray) -> np.ndarray:
+        return self.muvera.process_query(query_colpali_2d).reshape(-1, 16)
+
+    def _format_query_results(
+        self,
+        points: List[Any],
+        *,
+        top_k: int,
+        score_normalizer: int,
+    ) -> List[Dict[str, Any]]:
+        unique = []
+        seen = set()
+        normalized_score_divisor = max(int(score_normalizer), 1)
+        for point in points:
+            payload = point.payload or {}
+            key = (
+                payload.get("document_id", ""),
+                payload.get("page_number", -1),
+                payload.get("image_path", ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(
+                {
+                    "image_path": payload.get("image_path", ""),
+                    "score": point.score / normalized_score_divisor,
+                    "document_id": payload.get("document_id", ""),
+                    "document_name": payload.get("document_name", ""),
+                    "page_number": payload.get("page_number", 0),
+                }
+            )
+            if len(unique) >= top_k:
+                break
+
+        return unique
+
     def retrieve_with_two_stage(
         self,
         query_text: str,
         top_k: int = 3,
         prefetch_multiplier: int = 10,
         document_ids: Optional[List[str]] = None,
+        retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
     ) -> Dict[str, Any]:
         """
         执行两阶段检索。
@@ -612,98 +658,112 @@ class VisionVectorStore:
             
         返回值里既包含整理后的结果，也包含这一轮检索各阶段的耗时指标。
         """
+        resolved_mode = str(retrieval_mode or DEFAULT_RETRIEVAL_MODE).strip().lower()
+        if resolved_mode not in SUPPORTED_RETRIEVAL_MODES:
+            raise ValueError(f"Unsupported retrieval_mode: {retrieval_mode}")
+
         total_start = time.perf_counter()
+        query_colpali_2d: Optional[np.ndarray] = None
+        query_muvera_2d: Optional[np.ndarray] = None
+        colpali_query_embedding_ms = 0.0
+        muvera_query_embedding_ms = 0.0
+        colpali_query_token_count = 1
+        muvera_query_token_count = 1
 
-        # 先把文本问题编码成 ColPali 查询向量。
         query_embedding_start = time.perf_counter()
-        batch_queries = self.processor.process_queries([query_text]).to(self.device)
-        with torch.no_grad():
-            # 查询侧输出同样是多向量，而不是单个句向量。
-            query_embedding_tensor = self.model(**batch_queries)[0]
-        
-        query_colpali = query_embedding_tensor.float().cpu().numpy()
-        # 再派生一份压缩版查询向量，供第一阶段粗召回使用。
-        query_muvera = self.muvera.process_query(query_colpali)
+        query_colpali_2d = self._encode_colpali_query(query_text)
+        colpali_query_embedding_ms = (time.perf_counter() - query_embedding_start) * 1000
+        colpali_query_token_count = max(query_colpali_2d.shape[0], 1)
 
-        # 和文档侧一样，查询侧也显式重塑成二维，确保每行代表一个 token 向量。
-        query_colpali_2d = query_colpali.reshape(-1, 128)
-        query_muvera_2d = query_muvera.reshape(-1, 16)
-        query_embedding_ms = (time.perf_counter() - query_embedding_start) * 1000
-        # 查询越长，参与匹配的 query token 往往越多；这里按 token 数做归一化，
-        # 是为了让不同长度问题的分数更可比，便于统一使用 min_score 阈值。
-        n_query_tokens = max(query_colpali_2d.shape[0], 1)
+        if resolved_mode in {"two_stage", "muvera_only"}:
+            muvera_query_start = time.perf_counter()
+            query_muvera_2d = self._encode_muvera_query(query_colpali_2d)
+            muvera_query_embedding_ms = (time.perf_counter() - muvera_query_start) * 1000
+            muvera_query_token_count = max(query_muvera_2d.shape[0], 1)
+
+        query_embedding_ms = colpali_query_embedding_ms + muvera_query_embedding_ms
 
         query_filter = self._build_document_filter(document_ids)
 
-        # 一次 query_points 调用里同时完成粗召回和精排：
-        # - prefetch: 使用压缩向量从全库召回更大的候选集。
-        # - query:    使用原始多向量只对候选集做精排。
         qdrant_query_start = time.perf_counter()
-        results = self.qdrant.query_points(
-            collection_name=COLLECTION_NAME,
-            prefetch=[
-                models.Prefetch(
-                    query=query_muvera_2d.tolist(),
-                    using="muvera_fde",      # 用压缩向量先做第一阶段粗召回。
-                    limit=top_k * prefetch_multiplier,
-                )
-            ],
-            query=query_colpali_2d.tolist(),
-            using="original",                # 只在候选集上做高精度多向量匹配。
-            limit=top_k,
-            query_filter=query_filter,
-        )
+        if resolved_mode == "two_stage":
+            results = self.qdrant.query_points(
+                collection_name=COLLECTION_NAME,
+                prefetch=[
+                    models.Prefetch(
+                        query=query_muvera_2d.tolist(),
+                        using="muvera_fde",
+                        limit=top_k * prefetch_multiplier,
+                    )
+                ],
+                query=query_colpali_2d.tolist(),
+                using="original",
+                limit=top_k,
+                query_filter=query_filter,
+            )
+            score_normalizer = colpali_query_token_count
+            score_space = "colpali_original"
+            prefetch_limit = top_k * prefetch_multiplier
+        elif resolved_mode == "colpali_only":
+            results = self.qdrant.query_points(
+                collection_name=COLLECTION_NAME,
+                query=query_colpali_2d.tolist(),
+                using="original",
+                limit=top_k,
+                query_filter=query_filter,
+            )
+            score_normalizer = colpali_query_token_count
+            score_space = "colpali_original"
+            prefetch_limit = 0
+        else:
+            results = self.qdrant.query_points(
+                collection_name=COLLECTION_NAME,
+                query=query_muvera_2d.tolist(),
+                using="muvera_fde",
+                limit=top_k,
+                query_filter=query_filter,
+            )
+            score_normalizer = muvera_query_token_count
+            score_space = "muvera_fde"
+            prefetch_limit = 0
         qdrant_query_ms = (time.perf_counter() - qdrant_query_start) * 1000
 
-        # Qdrant 返回的是点级结果；这里进一步做页面级去重，避免同一页重复入选。
         result_format_start = time.perf_counter()
-        unique = []
-        seen = set()
-        for point in results.points:
-            payload = point.payload or {}
-            key = (
-                payload.get("document_id", ""),
-                payload.get("page_number", -1),
-                payload.get("image_path", ""),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(
-                {
-                    "image_path": payload.get("image_path", ""),
-                    "score": point.score / n_query_tokens,
-                    "document_id": payload.get("document_id", ""),
-                    "document_name": payload.get("document_name", ""),
-                    "page_number": payload.get("page_number", 0),
-                }
-            )
-            if len(unique) >= top_k:
-                break
+        unique = self._format_query_results(results.points, top_k=top_k, score_normalizer=score_normalizer)
 
         result_format_ms = (time.perf_counter() - result_format_start) * 1000
         total_retrieval_ms = (time.perf_counter() - total_start) * 1000
         retrieval_timing = {
+            "retrieval_mode": resolved_mode,
+            "colpali_query_embedding_ms": round(colpali_query_embedding_ms, 2),
+            "muvera_query_embedding_ms": round(muvera_query_embedding_ms, 2),
             "query_embedding_ms": round(query_embedding_ms, 2),
             "qdrant_query_ms": round(qdrant_query_ms, 2),
             "result_format_ms": round(result_format_ms, 2),
             "total_retrieval_ms": round(total_retrieval_ms, 2),
-            "prefetch_limit": top_k * prefetch_multiplier,
+            "prefetch_limit": prefetch_limit,
             "returned_points": len(unique),
+            "score_space": score_space,
         }
         logger.info(
-            "retrieval_timing total_retrieval_ms=%.2f qdrant_query_ms=%.2f query_embedding_ms=%.2f result_format_ms=%.2f top_k=%s prefetch_limit=%s",
+            "retrieval_timing mode=%s total_retrieval_ms=%.2f qdrant_query_ms=%.2f query_embedding_ms=%.2f colpali_query_embedding_ms=%.2f muvera_query_embedding_ms=%.2f result_format_ms=%.2f top_k=%s prefetch_limit=%s",
+            retrieval_timing["retrieval_mode"],
             retrieval_timing["total_retrieval_ms"],
             retrieval_timing["qdrant_query_ms"],
             retrieval_timing["query_embedding_ms"],
+            retrieval_timing["colpali_query_embedding_ms"],
+            retrieval_timing["muvera_query_embedding_ms"],
             retrieval_timing["result_format_ms"],
             top_k,
             retrieval_timing["prefetch_limit"],
         )
         print(
             "[Retrieval] "
+            f"mode={retrieval_timing['retrieval_mode']} "
             f"total={retrieval_timing['total_retrieval_ms']}ms "
             f"embed={retrieval_timing['query_embedding_ms']}ms "
+            f"colpali_embed={retrieval_timing['colpali_query_embedding_ms']}ms "
+            f"muvera_embed={retrieval_timing['muvera_query_embedding_ms']}ms "
             f"qdrant={retrieval_timing['qdrant_query_ms']}ms "
             f"format={retrieval_timing['result_format_ms']}ms "
             f"top_k={top_k} prefetch_limit={retrieval_timing['prefetch_limit']}"

@@ -2,12 +2,12 @@
 
 ![image-20260503161620235](assets/image-20260503161620235.png)
 
-基于 **ColPali + MUVERA + Qdrant** 的视觉文档问答系统。上传 PDF、图片或 PPTX 文件，系统将每页统一渲染为图像后用 ColPali 建立视觉索引，查询时两阶段检索召回最相关页面，再由豆包视觉大模型生成答案，并附上原页截图供溯源。
+基于 **ColPali + MUVERA + Qdrant** 的视觉文档问答系统。上传 PDF、图片或 PPTX 文件后，系统会将每页统一渲染为图像并建立视觉索引；当前网页端默认沿用 MUVERA Prefetch + ColPali Rerank 的两阶段检索路径，再由豆包视觉大模型生成答案，并附上原页截图供溯源。最新 20 题小规模 benchmark 显示：在当前 3 文档配置下，单阶段 ColPali 检索与两阶段检索质量持平，但平均检索延迟更低，因此两阶段路径更适合表述为可扩展架构，而不是已被当前实验验证的最优默认策略。
 
 ## 🌟 核心特性
 
 - **视觉文档支持**：PDF / PNG / JPG / JPEG / WEBP / PPTX，统一渲染为页面图像进入索引
-- **两阶段检索**：MUVERA 压缩向量快速海选（Prefetch）+ ColPali 原始多向量 MaxSim 精准重排（Rerank）
+- **可切换检索架构**：支持 `two_stage`（MUVERA Prefetch + ColPali Rerank）、`colpali_only` 和 `muvera_only` 三种模式；当前网页端默认走 `two_stage`，但最新 20 题 benchmark 上 `colpali_only` 在保持相同检索质量时平均更快
 - **归一化相关性得分**：MaxSim 原始分除以查询 token 数，得分落在 0–1 区间；默认采用 `score >= 0.60` 作为正式证据阈值，并补入少量 near-threshold 页面，减少 final evidence 丢页
 - **复合问题支持**：对以强分隔符拆出的多个子问题分别检索，再合并证据页，减少多问合并时只覆盖单一主题的问题
 - **多文档作用域查询**：Scope Bar 支持同时选中多个文档进行对话，也可切回全库检索
@@ -49,6 +49,7 @@ RAG/
 │   └── app.js                     # 所有交互逻辑
 ├── scripts/                       # benchmark 起草与评测脚本
 │   ├── bootstrap_rag_benchmark.py
+│   ├── build_retrieval_ablation_summary.py
 │   └── run_rag_eval.py
 ├── src/                           # AI 核心逻辑
 │   ├── config.py                  # 环境变量、运行目录与模型配置
@@ -132,9 +133,9 @@ python -m uvicorn backend.main:app --reload --port 8000
 
 1. 用户问题先经过轻量 guard，拦截明显与文档无关的闲聊 / 身份类问题
 2. 如果问题包含多个由强分隔符拆出的独立子问题，则对子问题分别检索，并在后端合并证据页
-3. 对单问题或每个子问题分别生成查询向量
-4. 使用 MUVERA 在 Qdrant 中进行第一阶段 Prefetch
-5. 用 ColPali 原始多向量执行 MaxSim 精排，得到最相关页面
+3. 当前网页端默认不显式传 `retrieval_mode`，后端会按 `two_stage` 路径处理；评测脚本可切换到 `colpali_only` / `muvera_only` 做检索消融
+4. 对单问题或每个子问题分别生成查询向量
+5. 默认路径会先使用 MUVERA 在 Qdrant 中进行第一阶段 Prefetch，再用 ColPali 原始多向量执行 MaxSim 精排；当前 20 题小规模 benchmark 尚未显示该路径优于 `colpali_only`
 6. 若有页面达到最小相关性阈值（默认 `score >= 0.60`），则直接使用这些证据页生成答案
 7. 若 strict evidence 不足以填满当前证据窗口，后端会补入少量 near-threshold 页面，减少 raw 命中但 final 丢页的情况
 8. 若某个问题或子问题连 near-threshold 页面也没有，但仍检索到候选页，则回退到该问题或子问题得分最高的 1 页证据继续生成答案；若页面内容已明确写出答案，可直接作答，否则会在说明层提示证据质量或写明无法确认
@@ -162,7 +163,7 @@ python -m uvicorn backend.main:app --reload --port 8000
 
 如果面试官问“为什么慢，是不是电脑性能太弱”，更准确的回答是：
 
-> 这是一个以视觉理解和可追溯性为优先目标的多模态 RAG 原型。上传时要做文档转图和视觉嵌入，问答时要做两阶段检索和外部多模态生成，所以整体链路天然比纯文本 RAG 更重。机器性能会影响体验，但真正的优化方向应该基于分段时序数据来判断，而不是直接把问题归因为电脑弱。
+> 这是一个以视觉理解和可追溯性为优先目标的多模态 RAG 原型。上传时要做文档转图和视觉嵌入，问答时当前默认走两阶段检索路径，并调用外部多模态模型生成答案，所以整体链路天然比纯文本 RAG 更重。机器性能会影响体验，但真正的优化方向应该基于分段时序数据来判断，而不是直接把问题归因为电脑弱。
 
 现实中的产品之所以通常不会让用户感到这么慢，核心不是只靠更强的机器，而是靠系统设计把重活拆开：
 
@@ -212,6 +213,8 @@ python scripts/run_rag_eval.py \
     --output-dir data/eval_runs/first_pass
 ```
 
+如果要做检索模式消融，可在同一份 benchmark 上分别追加 `--retrieval-mode two_stage`、`--retrieval-mode colpali_only`、`--retrieval-mode muvera_only`，再用 `scripts/build_retrieval_ablation_summary.py` 合并三份 `summary.json`。
+
 脚本会输出：
 
 - `summary.json`：自动汇总的 retrieval / latency / citation 指标
@@ -245,10 +248,20 @@ python scripts/run_rag_eval.py --review-csv data/eval_runs/first_pass/review_she
 
 这组数字属于自动 benchmark 指标，不是人工复核分数。当前 20 题 run 还没有补完人工评分；已经完成人工复核的是 earlier 10 题 reviewed subset，对应 `manual_answer_accuracy_avg = 1.0`、`manual_faithfulness_avg = 1.0`、`manual_citation_correctness_avg = 0.95`。
 
+### 当前 20 题检索消融结果
+
+最新检索模式消融结果保存在 `data/eval_runs/retrieval_ablation_20q_20260504_152822/`。在同一份 20 题 benchmark 上：
+
+- `two_stage`: `raw_page_hit_at_3 = 0.90`，`raw_page_mrr = 0.7792`，`avg_total_retrieval_ms = 444.327`
+- `colpali_only`: `raw_page_hit_at_3 = 0.90`，`raw_page_mrr = 0.7792`，`avg_total_retrieval_ms = 229.311`
+- `muvera_only`: `raw_page_hit_at_3 = 0.45`，`raw_page_mrr = 0.3333`，`avg_total_retrieval_ms = 416.154`
+
+这意味着：在当前 3 文档的小规模语料下，`colpali_only` 与 `two_stage` 检索质量持平，但平均检索延迟更低；`muvera_only` 的质量明显下降，且 `fallback_rate = 1.0`。因此，当前实验更支持把两阶段检索写成“为更大规模语料预留的可扩展架构”，而不是“已被当前 benchmark 证明优于单阶段 ColPali 的默认检索策略”。
+
 ### 简历 / 项目介绍表述参考
 
-中文：实现基于 ColPali、MUVERA 与 Qdrant 的多模态视觉 RAG 系统，支持 PDF / PPTX 文档问答、页面级证据回溯与复合问题检索；搭建并扩展到 20 题、覆盖 3 份真实文档的 benchmark，在最新自动评测中取得 90% final page Hit@3、0.7667 final page MRR、90% 引用命中 gold evidence。
+中文：实现基于 ColPali、MUVERA 与 Qdrant 的多模态视觉 RAG 系统，支持 PDF / PPTX 文档问答、页面级证据回溯与复合问题检索；搭建 20 题、覆盖 3 份真实文档的 benchmark，在自动评测中取得 90% final page Hit@3、0.7667 final page MRR、90% 引用命中 gold evidence，并通过检索模式消融实验发现：当前小规模配置下，单阶段 ColPali 检索与两阶段检索质量持平，但平均检索延迟更低。
 
-English: Built a multimodal visual RAG system on top of ColPali, MUVERA, and Qdrant for PDF/PPTX question answering with page-level evidence grounding and compound-query retrieval; expanded the benchmark to 20 questions across 3 real documents and achieved 90% final page Hit@3, 0.7667 final page MRR, and 90% citation-to-gold-evidence match in the latest automated evaluation.
+English: Built a multimodal visual RAG system on top of ColPali, MUVERA, and Qdrant for PDF/PPTX question answering with page-level evidence grounding and compound-query retrieval; built a 20-question benchmark across 3 real documents, achieved 90% final page Hit@3, 0.7667 final page MRR, and 90% citation-to-gold-evidence match in automated evaluation, and found through retrieval ablation that direct ColPali retrieval matches the current two-stage pipeline on quality while delivering lower retrieval latency in the current small-scale setup.
 
 如果你想把人工复核结论也写进去，建议单独注明样本范围，例如：在 earlier reviewed 10-question subset 上，manual answer accuracy 和 faithfulness 均为 1.0，manual citation correctness 为 0.95。这样不会把 10 题人工结果误说成 20 题人工结果。

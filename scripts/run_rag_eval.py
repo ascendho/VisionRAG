@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-score", type=float, help="Override benchmark default min_score.")
     parser.add_argument("--timeout-seconds", type=float, default=180.0, help="Read timeout for each chat request.")
     parser.add_argument("--limit", type=int, help="Only run the first N benchmark items.")
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=["two_stage", "colpali_only", "muvera_only"],
+        default="two_stage",
+        help="Retrieval mode to send to the backend during live eval runs.",
+    )
     parser.add_argument("--review-csv", help="If set, skip live requests and summarize a previously reviewed CSV.")
     return parser.parse_args()
 
@@ -126,6 +132,7 @@ def run_chat_sample(
     document_ids: Optional[List[str]],
     top_k: int,
     min_score: float,
+    retrieval_mode: str,
     chat_history: Sequence[Dict[str, Any]],
     timeout_seconds: float,
 ) -> Dict[str, Any]:
@@ -138,6 +145,7 @@ def run_chat_sample(
             "chat_history": list(chat_history or []),
             "top_k": top_k,
             "min_score": min_score,
+            "retrieval_mode": retrieval_mode,
         },
         stream=True,
         timeout=(10, timeout_seconds),
@@ -300,6 +308,7 @@ def evaluate_sample(sample: Dict[str, Any], response_data: Dict[str, Any]) -> Di
         "gold_answer": str(sample.get("gold_answer") or ""),
         "gold_answer_keywords": list(sample.get("gold_answer_keywords") or []),
         "notes": str(sample.get("notes") or ""),
+        "retrieval_mode": str(retrieval_timing.get("retrieval_mode") or "two_stage"),
         "guarded": int(bool(response_data.get("guarded"))),
         "guard_reason": str((response_data.get("guarded") or {}).get("reason") or ""),
         "raw_page_hit_at_1": hit_at_k(raw_predictions, gold_evidence, 1),
@@ -327,6 +336,8 @@ def evaluate_sample(sample: Dict[str, Any], response_data: Dict[str, Any]) -> Di
         "confidence_score": (response_data.get("confidence") or {}).get("score"),
         "selected_evidence_count": len(final_predictions),
         "raw_candidate_count": len(raw_predictions),
+        "colpali_query_embedding_ms": float(retrieval_timing.get("colpali_query_embedding_ms") or 0.0),
+        "muvera_query_embedding_ms": float(retrieval_timing.get("muvera_query_embedding_ms") or 0.0),
         "fallback_evidence_used": int(bool(retrieval_timing.get("fallback_evidence_used"))),
         "fallback_evidence_count": int(retrieval_timing.get("fallback_evidence_count") or 0),
         "fallback_best_score": float(retrieval_timing.get("fallback_best_score") or 0.0),
@@ -350,6 +361,7 @@ def summarize_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     summary = {
         "sample_count": len(records),
         "guarded_count": int(sum(int(record.get("guarded") or 0) for record in records)),
+        "retrieval_modes": sorted({str(record.get("retrieval_mode") or "") for record in records if str(record.get("retrieval_mode") or "")}),
         "raw_page_hit_at_1": numeric_average("raw_page_hit_at_1"),
         "raw_page_hit_at_3": numeric_average("raw_page_hit_at_3"),
         "raw_doc_hit_at_1": numeric_average("raw_doc_hit_at_1"),
@@ -363,6 +375,8 @@ def summarize_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "fallback_rate": numeric_average("fallback_evidence_used"),
         "avg_unsupported_sub_query_count": numeric_average("unsupported_sub_query_count"),
         "avg_confidence_score": numeric_average("confidence_score"),
+        "avg_colpali_query_embedding_ms": numeric_average("colpali_query_embedding_ms"),
+        "avg_muvera_query_embedding_ms": numeric_average("muvera_query_embedding_ms"),
         "avg_total_retrieval_ms": numeric_average("total_retrieval_ms"),
         "avg_client_first_token_ms": numeric_average("client_first_token_ms"),
         "avg_client_total_chat_ms": numeric_average("client_total_chat_ms"),
@@ -407,6 +421,7 @@ def write_review_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
         "gold_answer",
         "gold_answer_keywords",
         "notes",
+        "retrieval_mode",
         "guarded",
         "guard_reason",
         "raw_page_hit_at_1",
@@ -428,6 +443,8 @@ def write_review_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
         "reused_supported_sub_query_count",
         "confidence_label",
         "confidence_score",
+        "colpali_query_embedding_ms",
+        "muvera_query_embedding_ms",
         "query_embedding_ms",
         "qdrant_query_ms",
         "total_retrieval_ms",
@@ -464,6 +481,7 @@ def write_review_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
                     "gold_answer": record.get("gold_answer", ""),
                     "gold_answer_keywords": serialize_json(record.get("gold_answer_keywords") or []),
                     "notes": record.get("notes", ""),
+                    "retrieval_mode": record.get("retrieval_mode", ""),
                     "guarded": record.get("guarded", ""),
                     "guard_reason": record.get("guard_reason", ""),
                     "raw_page_hit_at_1": record.get("raw_page_hit_at_1", ""),
@@ -485,6 +503,8 @@ def write_review_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
                     "reused_supported_sub_query_count": record.get("reused_supported_sub_query_count", ""),
                     "confidence_label": record.get("confidence_label", ""),
                     "confidence_score": record.get("confidence_score", ""),
+                    "colpali_query_embedding_ms": record.get("colpali_query_embedding_ms", ""),
+                    "muvera_query_embedding_ms": record.get("muvera_query_embedding_ms", ""),
                     "query_embedding_ms": record.get("query_embedding_ms", ""),
                     "qdrant_query_ms": record.get("qdrant_query_ms", ""),
                     "total_retrieval_ms": record.get("total_retrieval_ms", ""),
@@ -522,6 +542,7 @@ def summarize_review_csv(path: Path) -> Dict[str, Any]:
         for row in reader:
             parsed = {
                 "benchmark_id": row.get("benchmark_id", ""),
+                "retrieval_mode": row.get("retrieval_mode", "two_stage"),
                 "raw_page_hit_at_1": parse_optional_float(row.get("raw_page_hit_at_1")),
                 "raw_page_hit_at_3": parse_optional_float(row.get("raw_page_hit_at_3")),
                 "raw_doc_hit_at_1": parse_optional_float(row.get("raw_doc_hit_at_1")),
@@ -535,6 +556,8 @@ def summarize_review_csv(path: Path) -> Dict[str, Any]:
                 "fallback_evidence_used": parse_optional_float(row.get("fallback_evidence_used")),
                 "unsupported_sub_query_count": parse_optional_float(row.get("unsupported_sub_query_count")),
                 "confidence_score": parse_optional_float(row.get("confidence_score")),
+                "colpali_query_embedding_ms": parse_optional_float(row.get("colpali_query_embedding_ms")),
+                "muvera_query_embedding_ms": parse_optional_float(row.get("muvera_query_embedding_ms")),
                 "total_retrieval_ms": parse_optional_float(row.get("total_retrieval_ms")),
                 "client_first_token_ms": parse_optional_float(row.get("client_first_token_ms")),
                 "client_total_chat_ms": parse_optional_float(row.get("client_total_chat_ms")),
@@ -554,6 +577,8 @@ def summarize_review_csv(path: Path) -> Dict[str, Any]:
 
 def print_summary(summary: Dict[str, Any]) -> None:
     print("RAG evaluation summary")
+    if summary.get("retrieval_modes"):
+        print(f"- retrieval modes: {', '.join(summary.get('retrieval_modes') or [])}")
     print(f"- samples: {summary.get('sample_count')}")
     print(f"- raw page Hit@1: {format_rate(summary.get('raw_page_hit_at_1'))}")
     print(f"- raw page Hit@3: {format_rate(summary.get('raw_page_hit_at_3'))}")
@@ -561,6 +586,8 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print(f"- final page Hit@1: {format_rate(summary.get('final_page_hit_at_1'))}")
     print(f"- final page Hit@3: {format_rate(summary.get('final_page_hit_at_3'))}")
     print(f"- final page MRR: {format_decimal(summary.get('final_page_mrr'))}")
+    print(f"- avg ColPali query embed ms: {format_decimal(summary.get('avg_colpali_query_embedding_ms'))}")
+    print(f"- avg MUVERA query embed ms: {format_decimal(summary.get('avg_muvera_query_embedding_ms'))}")
     print(f"- avg retrieval ms: {format_decimal(summary.get('avg_total_retrieval_ms'))}")
     print(f"- avg first token ms: {format_decimal(summary.get('avg_client_first_token_ms'))}")
     print(f"- avg total chat ms: {format_decimal(summary.get('avg_client_total_chat_ms'))}")
@@ -618,6 +645,7 @@ def main() -> int:
             document_ids=list(sample.get("document_ids") or []),
             top_k=int(args.top_k or sample.get("top_k") or defaults.get("top_k") or 5),
             min_score=float(args.min_score or sample.get("min_score") or defaults.get("min_score") or 0.6),
+            retrieval_mode=str(args.retrieval_mode or "two_stage"),
             chat_history=list(sample.get("chat_history") or defaults.get("chat_history") or []),
             timeout_seconds=float(args.timeout_seconds),
         )
