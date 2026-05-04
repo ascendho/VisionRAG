@@ -8,7 +8,7 @@
 
 - **视觉文档支持**：PDF / PNG / JPG / JPEG / WEBP / PPTX，统一渲染为页面图像进入索引
 - **两阶段检索**：MUVERA 压缩向量快速海选（Prefetch）+ ColPali 原始多向量 MaxSim 精准重排（Rerank）
-- **归一化相关性得分**：MaxSim 原始分除以查询 token 数，得分落在 0–1 区间；默认采用阈值按 `score >= 0.60` 判断，阈值稳定不受查询长度影响
+- **归一化相关性得分**：MaxSim 原始分除以查询 token 数，得分落在 0–1 区间；默认采用 `score >= 0.60` 作为正式证据阈值，并补入少量 near-threshold 页面，减少 final evidence 丢页
 - **复合问题支持**：对以强分隔符拆出的多个子问题分别检索，再合并证据页，减少多问合并时只覆盖单一主题的问题
 - **多文档作用域查询**：Scope Bar 支持同时选中多个文档进行对话，也可切回全库检索
 - **原页图片溯源**：每条回答附带匹配页面缩略图网格（最多 5 列自适应），点击大图查看；卡片显示文档名、页码与相关性得分
@@ -85,6 +85,8 @@ docker run -p 6333:6333 -p 6334:6334 \
     qdrant/qdrant
 ```
 
+推荐把 Docker 版 Qdrant 作为默认运行路径。若 `QDRANT_URL` 不可达，后端会自动回退到仓库内的 `qdrant_local/` embedded 存储，方便本地开发或离线调试；但做 benchmark 时，建议先确认当前实例实际连接的是 Docker 暴露的 6333 端口。
+
 ### 4. 运行服务
 
 ```bash
@@ -119,7 +121,8 @@ python -m uvicorn backend.main:app --reload --port 8000
 4. 使用 MUVERA 在 Qdrant 中进行第一阶段 Prefetch
 5. 用 ColPali 原始多向量执行 MaxSim 精排，得到最相关页面
 6. 若有页面达到最小相关性阈值（默认 `score >= 0.60`），则直接使用这些证据页生成答案
-7. 若某个问题或子问题没有页面达到阈值，但仍检索到候选页，则回退到该问题或子问题得分最高的 1 页证据继续生成答案；若页面内容已明确写出答案，可直接作答，否则会在说明层提示证据质量或写明无法确认
+7. 若 strict evidence 不足以填满当前证据窗口，后端会补入少量 near-threshold 页面，减少 raw 命中但 final 丢页的情况
+8. 若某个问题或子问题连 near-threshold 页面也没有，但仍检索到候选页，则回退到该问题或子问题得分最高的 1 页证据继续生成答案；若页面内容已明确写出答案，可直接作答，否则会在说明层提示证据质量或写明无法确认
 8. 将最终合并后的证据页截图与证据元数据送给豆包多模态模型生成答案
 
 ## 📏 证据质量分数说明
@@ -199,6 +202,10 @@ python scripts/run_rag_eval.py \
 - `summary.json`：自动汇总的 retrieval / latency / citation 指标
 - `detailed_results.json`：逐题原始结果，适合排查失败样例
 - `review_sheet.csv`：带空白人工评分列的复核表，可继续补 `manual_answer_accuracy`、`manual_faithfulness`、`manual_citation_correctness`
+- `benchmark_snapshot.json`：本次运行实际使用的 benchmark 快照，方便后续复现
+
+推荐长期保留：`summary.json`、`review_sheet_reviewed.csv`、`review_summary.json`、`benchmark_snapshot.json`。
+`detailed_results.json`、`review_sheet.csv`、`benchmarks/_validate_*` 和临时 smoke run 更适合在本地排查问题后清理掉，因此默认加入忽略规则。
 
 如果你已经手工补完 `review_sheet.csv`，可以单独做一次人工评分汇总：
 

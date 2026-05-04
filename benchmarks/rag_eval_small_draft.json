@@ -1,14 +1,14 @@
 {
   "version": "1.0",
-  "description": "自动起草的小规模视觉 RAG benchmark 草稿，请在跑分前复核问题、答案与页码。",
+  "description": "自动起草并人工扩充的小规模视觉 RAG benchmark，请在跑分前复核问题、答案与页码。",
   "defaults": {
     "top_k": 5,
     "min_score": 0.6,
     "chat_history": []
   },
   "metadata": {
-    "generated_at": "2026-05-03T21:07:21",
-    "requested_generation_mode": "llm",
+    "generated_at": "2026-05-04T11:17:11",
+    "requested_generation_mode": "mixed",
     "documents": [
       {
         "document_name": "waLLMartCache.pdf",
@@ -18,6 +18,11 @@
       {
         "document_name": "MemGPT.pdf",
         "document_id": "16e65f7cc5c1d647eb6acffdf085ce62",
+        "indexed_in_backend": null
+      },
+      {
+        "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+        "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
         "indexed_in_backend": null
       }
     ]
@@ -244,6 +249,237 @@
       "notes": "自动起草草稿，请复核答案是否可由单页直接得出。来源模式：llm。",
       "source_excerpt": "o perform a multi-hop lookup. In our setup, we fix the total number of UUIDs pairs to 140, corresponding to roughly 8k tokens (the context length of our GPT-4 base- line). We vary the total number of nesting levels from 0 (the initial key-value pair’s value is n",
       "generation_mode": "llm"
+    },
+    {
+      "id": "auto-011",
+      "question": "互联网异步设计挑战相关内容中给出的光速数值是多少？",
+      "question_type": "数值查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 12
+        }
+      ],
+      "gold_answer": "300000 km/s",
+      "gold_answer_keywords": [
+        "300000 km/s"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "Internet Design Challenges – Asynchrony Challenge: The Internet is asynchronous . We're constrained by the speed of light. Any data we receive is already dated. 4,125 km distance. Speed of light is 300,000 km/s. Trip takes 13.75 ms. By the time the message is ",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-012",
+      "question": "在 4,125 km 的距离下，页面给出的单程 trip takes 多长时间？",
+      "question_type": "数值查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 12
+        }
+      ],
+      "gold_answer": "13.75 ms",
+      "gold_answer_keywords": [
+        "13.75 ms"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "ceive is already dated. 4,125 km distance. Speed of light is 300,000 km/s. Trip takes 13.75 ms. By the time the message is sent, our 3 GHz CPU has executed 42,000,000 more cycles!",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-013",
+      "question": "根据该页，负责标准化并发布 RFC 协议文档的组织是什么？",
+      "question_type": "事实查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 16
+        }
+      ],
+      "gold_answer": "IETF（Internet Engineering Task Force）",
+      "gold_answer_keywords": [
+        "IETF",
+        "Internet Engineering Task Force"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": " say \"Excuse me!\" Designing a good protocol is harder than it first seems! The IETF ( Internet Engineering Task Force ) standardizes and publishes protocols in RFC ( Request For Comments ) documents.",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-014",
+      "question": "根据该页定义，protocol 的 syntax 指什么？",
+      "question_type": "定义查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 16
+        }
+      ],
+      "gold_answer": "消息的格式（Format of messages）",
+      "gold_answer_keywords": [
+        "Format of messages",
+        "消息的格式",
+        "Syntax"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": " about designing protocols . Protocol: A specification on how to communicate. Syntax: Format of messages. What do the 1s and 0s mean? Semantics: What actions should I take in response to certain messages? Example: Protocol for asking a question in lecture? Raise your hand. Wai",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-015",
+      "question": "在这份分层架构中，哪一层负责可靠交付数据包并形成连接？",
+      "question_type": "事实查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 32
+        }
+      ],
+      "gold_answer": "第4层（Transport / 传输层）",
+      "gold_answer_keywords": [
+        "Layer 4",
+        "Transport",
+        "传输层"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "Layer 4 – Reliability Transport layer builds on top of Layer 3 (global packet delivery). Adds extra mechanisms (e.g. re-sending lost packets) for reliable packet delivery. Splits up large data into packet",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-016",
+      "question": "根据该页，packet 需要额外的什么来告诉我们该如何处理它？",
+      "question_type": "事实查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 35
+        }
+      ],
+      "gold_answer": "metadata",
+      "gold_answer_keywords": [
+        "metadata"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "t router. The router has no idea what these bits are for! The packet needs some extra metadata , to tell us what to do with the packet. Analogy: Letter needs to be put in an envelope. Envelope describes what to do with the letter. R1 A R2 R3 B Sender Recipient Router",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-017",
+      "question": "在邮政类比中，谁会读取绿色 header 并忽略里面的 payload？",
+      "question_type": "事实查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 46
+        }
+      ],
+      "gold_answer": "Mailman",
+      "gold_answer_keywords": [
+        "Mailman"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "Postal Analogy Each person only cares about the headers at their layer. Mailman reads the green header, ignores all the payload inside. Each person communicates with its peers at the same layer. Alice's secretary writes the blue header, for Bob's secre",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-018",
+      "question": "根据页面内容，router 只实现第几层到第几层？",
+      "question_type": "数值查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 58
+        }
+      ],
+      "gold_answer": "第1层到第3层",
+      "gold_answer_keywords": [
+        "Layers 1–3",
+        "Layers 1-3",
+        "1–3",
+        "1-3"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "essage, and wrap headers all the way down to bits on the wire. Routers only implement Layers 1–3. Must parse the packet (1, 2) and forward to the next router for global delivery (3). Routers don't support reliable delivery (4). Routers don't care about the application ",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-019",
+      "question": "根据该页，router 为 next hop 添加的新 header 是哪一层的 header？",
+      "question_type": "事实查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 60
+        }
+      ],
+      "gold_answer": "Layer 2 Header",
+      "gold_answer_keywords": [
+        "Layer 2 Header",
+        "Layer 2"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "Layer 2 Header Bits received over wire. New Layer 2 Header Bits sent over wire. Multiple Headers with Routers Routers unwrap the Layer 2 header, and add a new Layer 2 header for the next ",
+      "generation_mode": "manual_reviewed"
+    },
+    {
+      "id": "auto-020",
+      "question": "在总结页中，L4 header（port）用于标识什么？",
+      "question_type": "事实查找",
+      "document_ids": [
+        "996c5155716e6b6fd3b10bacfd7a0f4f"
+      ],
+      "gold_evidence": [
+        {
+          "document_id": "996c5155716e6b6fd3b10bacfd7a0f4f",
+          "document_name": "[CS168 SP25] Lecture 1 - Layers of the Internet.pptx",
+          "page_number": 67
+        }
+      ],
+      "gold_answer": "end host 上的 specific application",
+      "gold_answer_keywords": [
+        "specific application",
+        "end host",
+        "L4 header"
+      ],
+      "notes": "基于 CS168 PPTX 手动复核后的单页 benchmark 条目。",
+      "source_excerpt": "router. L 3 header: Destination is always the end host. L4 header (port) : Identifies specific application on the end host.",
+      "generation_mode": "manual_reviewed"
     }
   ]
 }

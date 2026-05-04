@@ -42,6 +42,26 @@ python scripts/bootstrap_rag_benchmark.py \
 5. 补完 `review_sheet.csv` 里的人工评分列。
 6. 再跑一次 review summary，得到答案准确性、faithfulness、citation correctness 的汇总结果。
 
+## 产物保留建议
+
+建议把 benchmark 相关产物分成“长期保留”和“临时排查”两类。
+
+长期保留：
+
+- `rag_eval_small_draft.json` 这类已经人工确认过的 benchmark 源文件。
+- `sample-documents/` 中参与 benchmark 的源文档。
+- 某次正式 run 下的 `summary.json`、`review_sheet_reviewed.csv`、`review_summary.json`、`benchmark_snapshot.json`。
+
+临时排查后可删除：
+
+- `benchmarks/_validate_bootstrap.json`
+- `benchmarks/_validate_bootstrap_review.csv`
+- 每次 run 中的 `detailed_results.json`
+- 尚未补人工评分的 `review_sheet.csv`
+- 只用于冒烟验证的 `eval_runs/smoke_*`
+
+如果你希望仓库长期保持干净，建议只把 benchmark 定义文件纳入版本控制，把 `eval_runs/` 留在本地或单独归档。
+
 ## Benchmark 文件结构
 
 顶层字段：

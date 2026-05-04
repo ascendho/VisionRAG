@@ -51,6 +51,7 @@ _PRE_RETRIEVAL_GUARD_PATTERNS = [
 ]
 
 _COMPOUND_QUERY_SPLIT_PATTERN = re.compile(r"[？?；;\n]+")
+_NEAR_THRESHOLD_GAP = 0.05
 
 
 def _normalize_query_text(query: str) -> str:
@@ -131,27 +132,66 @@ def _filter_results_by_min_score(results: List[Dict[str, Any]], min_score: float
     return [dict(item) for item in results if float(item.get("score", 0.0)) >= min_score]
 
 
+def _prepare_selected_result(item: Dict[str, Any], min_score: float, *, is_fallback: bool, reason: str = "") -> Dict[str, Any]:
+    cloned = dict(item)
+    source_score = float(cloned.get("score", 0.0))
+    fallback_gap = round(max(float(min_score) - source_score, 0.0), 2)
+    cloned["fallback_below_threshold"] = is_fallback
+    cloned["fallback_source_score"] = source_score
+    cloned["fallback_gap_to_threshold"] = fallback_gap if is_fallback else 0.0
+    cloned["fallback_tier"] = (
+        "formal"
+        if not is_fallback
+        else "near_threshold" if fallback_gap <= _NEAR_THRESHOLD_GAP else "low_confidence"
+    )
+    cloned["fallback_reason"] = reason if is_fallback else ""
+    return cloned
+
+
 def _select_results_with_threshold_fallback(
     results: List[Dict[str, Any]],
     min_score: float,
     fallback_limit: int = 1,
+    selection_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
-    strict_results = _filter_results_by_min_score(results, min_score)
-    if strict_results:
-        prepared_results = []
-        for item in strict_results:
-            cloned = dict(item)
-            cloned["fallback_below_threshold"] = False
-            cloned["fallback_source_score"] = float(cloned.get("score", 0.0))
-            cloned["fallback_gap_to_threshold"] = 0.0
-            cloned["fallback_tier"] = "formal"
-            cloned["fallback_reason"] = ""
-            prepared_results.append(cloned)
+    max_selected = max(1, int(selection_limit or len(results) or fallback_limit))
+    strict_results = _filter_results_by_min_score(results, min_score)[:max_selected]
+    prepared_results = [
+        _prepare_selected_result(item, min_score, is_fallback=False)
+        for item in strict_results
+    ]
+
+    supplemental_results: List[Dict[str, Any]] = []
+    available_slots = max(max_selected - len(prepared_results), 0)
+    near_threshold_floor = max(float(min_score) - _NEAR_THRESHOLD_GAP, 0.0)
+    if available_slots > 0:
+        for item in results:
+            score = float(item.get("score", 0.0))
+            if score >= min_score or score < near_threshold_floor:
+                continue
+            supplemental_results.append(
+                _prepare_selected_result(
+                    item,
+                    min_score,
+                    is_fallback=True,
+                    reason=f"supplemented_near_threshold<{min_score:.2f}",
+                )
+            )
+            if len(supplemental_results) >= available_slots:
+                break
+
+    if prepared_results or supplemental_results:
+        fallback_best_score = 0.0
+        if supplemental_results:
+            fallback_best_score = round(
+                max(float(item.get("score", 0.0)) for item in supplemental_results),
+                2,
+            )
         return {
-            "selected_results": prepared_results,
-            "fallback_used": False,
-            "fallback_count": 0,
-            "fallback_best_score": 0.0,
+            "selected_results": (prepared_results + supplemental_results)[:max_selected],
+            "fallback_used": bool(supplemental_results),
+            "fallback_count": len(supplemental_results),
+            "fallback_best_score": fallback_best_score,
         }
 
     if not results:
@@ -163,16 +203,15 @@ def _select_results_with_threshold_fallback(
         }
 
     promoted_results: List[Dict[str, Any]] = []
-    for item in results[:max(1, int(fallback_limit))]:
-        cloned = dict(item)
-        source_score = float(cloned.get("score", 0.0))
-        fallback_gap = round(max(float(min_score) - source_score, 0.0), 2)
-        cloned["fallback_below_threshold"] = True
-        cloned["fallback_source_score"] = source_score
-        cloned["fallback_gap_to_threshold"] = fallback_gap
-        cloned["fallback_tier"] = "near_threshold" if fallback_gap <= 0.05 else "low_confidence"
-        cloned["fallback_reason"] = f"best_available_below_threshold<{min_score:.2f}"
-        promoted_results.append(cloned)
+    for item in results[:min(max_selected, max(1, int(fallback_limit)))]:
+        promoted_results.append(
+            _prepare_selected_result(
+                item,
+                min_score,
+                is_fallback=True,
+                reason=f"best_available_below_threshold<{min_score:.2f}",
+            )
+        )
 
     return {
         "selected_results": promoted_results,
@@ -549,7 +588,12 @@ def _retrieve_compound_aware(
             top_k=top_k,
         )
         results = retrieval_payload["results"]
-        selection_meta = _select_results_with_threshold_fallback(results, min_score)
+        selection_meta = _select_results_with_threshold_fallback(
+            results,
+            min_score,
+            fallback_limit=1,
+            selection_limit=top_k,
+        )
         selected_results = selection_meta["selected_results"]
         sub_query_text = sub_queries[0] if sub_queries else retrieval_query_text
         return {
@@ -598,7 +642,12 @@ def _retrieve_compound_aware(
             top_k=per_sub_query_top_k,
         )
         raw_results = retrieval_payload["results"]
-        selection_meta = _select_results_with_threshold_fallback(raw_results, min_score)
+        selection_meta = _select_results_with_threshold_fallback(
+            raw_results,
+            min_score,
+            fallback_limit=1,
+            selection_limit=per_sub_query_top_k,
+        )
         selected_results = selection_meta["selected_results"]
         raw_result_groups.append(raw_results)
         selected_result_groups.append(selected_results)
