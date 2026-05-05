@@ -14,13 +14,18 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 try:
     import requests
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit("requests is required. Install dependencies from requirements.txt first.") from exc
 
+from src.eval.faithfulness_judge import score_multimodal_faithfulness
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
 DEFAULT_EVAL_RUNS_DIR = Path(os.getenv("EVAL_RUNS_DIR", str(REPO_ROOT / "data" / "eval_runs")))
 
 
@@ -50,6 +55,15 @@ def parse_args() -> argparse.Namespace:
         choices=["two_stage", "colpali_only", "muvera_only"],
         default="two_stage",
         help="Retrieval mode to send to the backend during live eval runs.",
+    )
+    parser.add_argument(
+        "--disable-automatic-faithfulness",
+        action="store_true",
+        help="Skip the multimodal faithfulness judge during live eval runs.",
+    )
+    parser.add_argument(
+        "--faithfulness-model-name",
+        help="Optional override for the model used by the multimodal faithfulness judge.",
     )
     parser.add_argument("--review-csv", help="If set, skip live requests and summarize a previously reviewed CSV.")
     return parser.parse_args()
@@ -281,7 +295,13 @@ def format_evidence_list(evidences: Sequence[Dict[str, Any]], limit: int = 3) ->
     return " | ".join(formatted)
 
 
-def evaluate_sample(sample: Dict[str, Any], response_data: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_sample(
+    sample: Dict[str, Any],
+    response_data: Dict[str, Any],
+    *,
+    enable_automatic_faithfulness: bool = True,
+    faithfulness_model_name: Optional[str] = None,
+) -> Dict[str, Any]:
     gold_evidence = list(sample.get("gold_evidence") or [])
     raw_predictions = list(response_data.get("all_candidates") or [])
     final_predictions = list(response_data.get("evidences") or [])
@@ -298,6 +318,17 @@ def evaluate_sample(sample: Dict[str, Any], response_data: Dict[str, Any]) -> Di
     )
 
     keyword_metrics = compute_keyword_metrics(answer_text, sample.get("gold_answer_keywords") or [])
+    automatic_faithfulness = score_multimodal_faithfulness(
+        question=str(sample.get("question") or ""),
+        answer_text=answer_text,
+        evidences=final_predictions,
+        model_name=faithfulness_model_name,
+    ) if enable_automatic_faithfulness else {
+        "score": None,
+        "label": "disabled",
+        "reason": "Disabled by CLI flag.",
+        "provider": "doubao_multimodal_judge",
+    }
 
     return {
         "benchmark_id": str(sample.get("id") or ""),
@@ -332,6 +363,10 @@ def evaluate_sample(sample: Dict[str, Any], response_data: Dict[str, Any]) -> Di
         "citation_has_gold_evidence": cited_gold_evidence,
         "answer_contains_gold_answer": compute_answer_string_match(answer_text, str(sample.get("gold_answer") or "")),
         **keyword_metrics,
+        "automatic_faithfulness": automatic_faithfulness.get("score"),
+        "automatic_faithfulness_label": automatic_faithfulness.get("label", ""),
+        "automatic_faithfulness_reason": automatic_faithfulness.get("reason", ""),
+        "automatic_faithfulness_provider": automatic_faithfulness.get("provider", ""),
         "confidence_label": str((response_data.get("confidence") or {}).get("label") or ""),
         "confidence_score": (response_data.get("confidence") or {}).get("score"),
         "selected_evidence_count": len(final_predictions),
@@ -385,7 +420,11 @@ def summarize_records(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "answer_contains_gold_answer_rate": numeric_average("answer_contains_gold_answer"),
         "keyword_coverage_avg": numeric_average("keyword_coverage"),
         "keyword_full_match_rate": numeric_average("keyword_full_match"),
+        "automatic_faithfulness_avg": numeric_average("automatic_faithfulness"),
     }
+    summary["automatic_faithfulness_scored_samples"] = sum(
+        1 for record in records if record.get("automatic_faithfulness") not in (None, "")
+    )
 
     manual_fields = [
         "manual_answer_accuracy",
@@ -456,6 +495,10 @@ def write_review_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
         "answer_contains_gold_answer",
         "keyword_coverage",
         "keyword_full_match",
+        "automatic_faithfulness",
+        "automatic_faithfulness_label",
+        "automatic_faithfulness_reason",
+        "automatic_faithfulness_provider",
         "matched_keywords",
         "citations",
         "top_selected_evidence",
@@ -516,6 +559,10 @@ def write_review_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
                     "answer_contains_gold_answer": record.get("answer_contains_gold_answer", ""),
                     "keyword_coverage": record.get("keyword_coverage", ""),
                     "keyword_full_match": record.get("keyword_full_match", ""),
+                    "automatic_faithfulness": record.get("automatic_faithfulness", ""),
+                    "automatic_faithfulness_label": record.get("automatic_faithfulness_label", ""),
+                    "automatic_faithfulness_reason": record.get("automatic_faithfulness_reason", ""),
+                    "automatic_faithfulness_provider": record.get("automatic_faithfulness_provider", ""),
                     "matched_keywords": serialize_json(record.get("matched_keywords") or []),
                     "citations": serialize_json(record.get("citations") or []),
                     "top_selected_evidence": format_evidence_list(record.get("returned_evidences") or []),
@@ -566,6 +613,7 @@ def summarize_review_csv(path: Path) -> Dict[str, Any]:
                 "answer_contains_gold_answer": parse_optional_float(row.get("answer_contains_gold_answer")),
                 "keyword_coverage": parse_optional_float(row.get("keyword_coverage")),
                 "keyword_full_match": parse_optional_float(row.get("keyword_full_match")),
+                "automatic_faithfulness": parse_optional_float(row.get("automatic_faithfulness")),
                 "manual_answer_accuracy": parse_optional_float(row.get("manual_answer_accuracy")),
                 "manual_faithfulness": parse_optional_float(row.get("manual_faithfulness")),
                 "manual_citation_correctness": parse_optional_float(row.get("manual_citation_correctness")),
@@ -594,6 +642,8 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print(f"- fallback rate: {format_rate(summary.get('fallback_rate'))}")
     print(f"- answer has citation rate: {format_rate(summary.get('answer_has_citation_rate'))}")
     print(f"- citation hits gold evidence rate: {format_rate(summary.get('citation_has_gold_evidence_rate'))}")
+    if summary.get("automatic_faithfulness_scored_samples"):
+        print(f"- automatic faithfulness avg: {format_decimal(summary.get('automatic_faithfulness_avg'))}")
     if summary.get("manual_reviewed_samples"):
         print(f"- manual answer accuracy avg: {format_decimal(summary.get('manual_answer_accuracy_avg'))}")
         print(f"- manual faithfulness avg: {format_decimal(summary.get('manual_faithfulness_avg'))}")
@@ -649,7 +699,12 @@ def main() -> int:
             chat_history=list(sample.get("chat_history") or defaults.get("chat_history") or []),
             timeout_seconds=float(args.timeout_seconds),
         )
-        record = evaluate_sample(sample, response_data)
+        record = evaluate_sample(
+            sample,
+            response_data,
+            enable_automatic_faithfulness=not args.disable_automatic_faithfulness,
+            faithfulness_model_name=args.faithfulness_model_name,
+        )
         records.append(record)
 
     summary = summarize_records(records)
