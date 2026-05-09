@@ -19,7 +19,7 @@
 | 层次 | 技术 |
 |---|---|
 | 视觉嵌入模型 | ColPali v1.3（`vidore/colpali-v1.3`），128-D 多向量 |
-| 加速检索 | MUVERA 16-D FDE（fastembed），Prefetch 倍率 5× |
+| 加速检索 | MUVERA 16-D FDE（fastembed），Prefetch 倍率 10× |
 | 向量数据库 | Qdrant（本地 Docker 或云端），MaxSim 比较器 |
 | 大语言模型 | 豆包 Seed 2.0 Pro（`doubao-seed-2-0-pro-260215`），Volcengine ARK API |
 | 后端框架 | FastAPI + uvicorn |
