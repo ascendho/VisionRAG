@@ -2,12 +2,12 @@
 
 ![image-20260503161620235](assets/image-20260503161620235.png)
 
-**ColPali + MUVERA + Qdrant** 驱动的多模态文档检索与问答系统。上传 PDF、图片或 PPTX 文件后，系统会将每页统一渲染为图像并建立视觉索引；当前网页端默认沿用 MUVERA Prefetch + ColPali Rerank 的两阶段检索路径，再由豆包多模态大模型生成答案，并附上原页截图供溯源。最新 20 题 benchmark 显示：两阶段路径在当前小规模语料上能够稳定取得 `90% final page Hit@3` 与 `0.7667 final page MRR`，也体现出“轻量召回 + 精排复核”的双路检索设计思路；但在当前 3 文档配置下，单阶段 ColPali 的平均检索延迟更低，因此两阶段路径更适合表述为具备工程扩展潜力的检索架构，而不是已被当前实验充分证明的最优默认策略。
+**ColPali + MUVERA + Qdrant** 驱动的多模态文档检索与问答系统。上传 PDF、图片或 PPTX 文件后，系统会将每页统一渲染为图像并建立视觉索引；当前网页端默认沿用 MUVERA 单向量 FDE Prefetch + ColPali 多向量 Rerank 的两阶段检索路径，再由豆包多模态大模型生成答案，并附上原页截图供溯源。最新 20 题 benchmark 显示：两阶段路径在当前小规模语料上能够稳定取得 `90% final page Hit@3` 与 `0.7667 final page MRR`，也体现出“轻量召回 + 精排复核”的双路检索设计思路；但单向量 MUVERA FDE 在本轮检索消融中取得了更高的 raw Hit@3 和 MRR。因此，两阶段路径更适合表述为具备工程扩展潜力的检索架构，而不是已被当前实验充分证明的最优默认策略。
 
 ## 🌟 核心特性
 
 - **视觉文档支持**：PDF / PNG / JPG / JPEG / WEBP / PPTX，统一渲染为页面图像进入索引
-- **可切换检索架构**：支持 `two_stage`（MUVERA Prefetch + ColPali Rerank）、`colpali_only` 和 `muvera_only` 三种模式；当前网页端默认走 `two_stage`，其主要价值在于把轻量召回与视觉精排解耦，为更大规模语料预留扩展空间；在最新 20 题 benchmark 上，`colpali_only` 在保持相同检索质量时平均更快
+- **可切换检索架构**：支持 `two_stage`（MUVERA 单向量 FDE Prefetch + ColPali Rerank）、`colpali_only` 和 `muvera_only` 三种模式；当前网页端默认走 `two_stage`，其主要价值在于把轻量召回与视觉精排解耦，为更大规模语料预留扩展空间；在最新同进程 20 题 benchmark 上，`two_stage` 与 `colpali_only` 检索质量持平，而 `muvera_only` 的 raw Hit@3 更高、平均检索延迟更低
 - **归一化相关性得分**：MaxSim 原始分除以查询 token 数，得分落在 0–1 区间；默认采用 `score >= 0.60` 作为正式证据阈值，并补入少量 near-threshold 页面，减少 final evidence 丢页
 - **复合问题支持**：对以强分隔符拆出的多个子问题分别检索，再合并证据页，减少多问合并时只覆盖单一主题的问题
 - **多文档作用域查询**：Scope Bar 支持同时选中多个文档进行对话，也可切回全库检索
@@ -19,8 +19,8 @@
 | 层次 | 技术 |
 |---|---|
 | 视觉嵌入模型 | ColPali v1.3（`vidore/colpali-v1.3`），128-D 多向量 |
-| 加速检索 | MUVERA 16-D FDE（fastembed），Prefetch 倍率 10× |
-| 向量数据库 | Qdrant（本地 Docker 或云端），MaxSim 比较器 |
+| 加速检索 | MUVERA 固定维度单向量 FDE（fastembed，当前参数 30720-D），Prefetch 倍率 10× |
+| 向量数据库 | Qdrant（本地 Docker 或云端），单向量 FDE 检索 + ColPali MaxSim 多向量精排 |
 | 大语言模型 | 豆包 Seed 2.0 Pro（`doubao-seed-2-0-pro-260215`），Volcengine ARK API |
 | 后端框架 | FastAPI + uvicorn |
 | 前端 | 原生 HTML/JS + Tailwind CSS CDN + marked.js |
@@ -126,8 +126,8 @@ python -m uvicorn backend.main:app --reload --port 8000
 2. 将文档统一转换为页面图像
     - PPTX 会先转成 PDF，再复用现有 PDF 转页图链路
 3. 使用 ColPali 为每一页生成多向量视觉特征
-4. 使用 MUVERA 生成压缩向量，作为第一阶段快速召回特征
-5. 将原始多向量与压缩向量一起写入 Qdrant
+4. 使用 MUVERA 生成固定维度单向量 FDE，作为第一阶段快速召回特征
+5. 将 ColPali 原始多向量与 MUVERA 单向量 FDE 一起写入 Qdrant
 
 ### 2. 对话与回答
 
@@ -136,7 +136,7 @@ python -m uvicorn backend.main:app --reload --port 8000
     - 若后续子问题出现“他 / 它 / 那它”这类指代，后端会优先桥接前一个子问题的局部上下文，再进入后续检索改写逻辑
 3. 当前网页端默认不显式传 `retrieval_mode`，后端会按 `two_stage` 路径处理；评测脚本可切换到 `colpali_only` / `muvera_only` 做检索消融
 4. 对单问题或每个子问题分别生成查询向量
-5. 默认路径会先使用 MUVERA 在 Qdrant 中进行第一阶段 Prefetch，再用 ColPali 原始多向量执行 MaxSim 精排；当前 20 题小规模 benchmark 尚未显示该路径优于 `colpali_only`
+5. 默认路径会先使用 MUVERA 单向量 FDE 在 Qdrant 中进行第一阶段 Prefetch，再用 ColPali 原始多向量执行 MaxSim 精排；当前 20 题小规模 benchmark 尚未显示该路径优于 `colpali_only` 或 `muvera_only`
 6. 若有页面达到最小相关性阈值（默认 `score >= 0.60`），则直接使用这些证据页生成答案
 7. 若 strict evidence 不足以填满当前证据窗口，后端会补入少量 near-threshold 页面，减少 raw 命中但 final 丢页的情况
 8. 若某个问题或子问题连 near-threshold 页面也没有，但仍检索到候选页，则回退到该问题或子问题得分最高的 1 页证据继续生成答案；若页面内容已明确写出答案，可直接作答，否则会在说明层提示证据质量或写明无法确认
@@ -144,7 +144,7 @@ python -m uvicorn backend.main:app --reload --port 8000
 
 ## 📏 证据质量与 benchmark 指标说明
 
-- 单页 `score`：Qdrant MaxSim 原始分除以 query token 数得到的归一化分数，目的是减弱查询长度对阈值的影响
+- 单页 `score`：`two_stage` / `colpali_only` 下使用 Qdrant MaxSim 原始分除以 query token 数得到的归一化分数；`muvera_only` 下会对单向量 FDE 的 DOT 分数做额外尺度校准，目的是让证据阈值和 confidence 不被原始分数空间放大
 - 顶部“证据质量”分数：当前已采用证据页中 top-3 分数的平均值，保留两位小数
 - 这个分数是轻量相关性指标，不代表事实正确率；它更适合回答“当前回答依赖的证据页有多贴题”
 
@@ -256,35 +256,35 @@ python scripts/run_rag_eval.py --review-csv data/eval_runs/first_pass/review_she
 
 ### 当前 20 题 benchmark 结果
 
-当前正式 benchmark 为 20 题，覆盖 3 份真实 PDF / PPTX 文档。最近一轮结果保存在 `data/eval_runs/faithfulness_20q_20260505_150958/summary.json`，其中：
+当前正式 benchmark 为 20 题，覆盖 3 份真实 PDF / PPTX 文档。迁移到 MUVERA 单向量 FDE 后，默认 `two_stage` 的最近一轮完整结果保存在 `data/eval_runs/muvera_fde_ablation_20q_two_stage_faithfulness/summary.json`，其中：
 
 - `final_page_hit_at_3 = 0.90`
 - `final_page_mrr = 0.7667`
 - `citation_has_gold_evidence_rate = 0.90`
-- `answer_contains_gold_answer_rate = 0.80`
-- `keyword_coverage_avg = 0.90`
+- `answer_contains_gold_answer_rate = 0.85`
+- `keyword_coverage_avg = 0.9333`
 - `automatic_faithfulness_avg = 1.00`
 - `automatic_faithfulness_scored_samples = 20`
 - `fallback_rate = 0.50`
 
-这组数字属于自动 benchmark 指标，不是人工复核分数。需要强调的是，`automatic_faithfulness = 1.00` 反映的是“返回证据是否直接支撑回答”；同一轮 `answer_contains_gold_answer_rate = 0.80` 也说明系统整体答案正确率并未达到满分。当前 20 题 run 还没有补完人工评分；已经完成人工复核的是 earlier 10 题 reviewed subset，对应 `manual_answer_accuracy_avg = 1.0`、`manual_faithfulness_avg = 1.0`、`manual_citation_correctness_avg = 0.95`。
+这组数字属于自动 benchmark 指标，不是人工复核分数。需要强调的是，`automatic_faithfulness = 1.00` 反映的是“返回证据是否直接支撑回答”；同一轮 `answer_contains_gold_answer_rate = 0.85` 也说明系统整体答案正确率并未达到满分。当前 20 题 run 还没有补完人工评分；已经完成人工复核的是 earlier 10 题 reviewed subset，对应 `manual_answer_accuracy_avg = 1.0`、`manual_faithfulness_avg = 1.0`、`manual_citation_correctness_avg = 0.95`。
 
 ### 当前 20 题检索消融结果
 
-最新检索模式消融结果保存在 `data/eval_runs/retrieval_ablation_20q_20260504_152822/`。在同一份 20 题 benchmark 上：
+最新同进程检索模式消融结果保存在 `data/eval_runs/apples_20260509_213156_comparison_summary.json`。在同一份 20 题 benchmark 上：
 
-- `two_stage`: `raw_page_hit_at_3 = 0.90`，`raw_page_mrr = 0.7792`，`avg_total_retrieval_ms = 444.327`
-- `colpali_only`: `raw_page_hit_at_3 = 0.90`，`raw_page_mrr = 0.7792`，`avg_total_retrieval_ms = 229.311`
-- `muvera_only`: `raw_page_hit_at_3 = 0.45`，`raw_page_mrr = 0.3333`，`avg_total_retrieval_ms = 416.154`
+- `two_stage`: `raw_page_hit_at_3 = 0.90`，`raw_page_mrr = 0.7792`，`avg_total_retrieval_ms = 357.636`
+- `colpali_only`: `raw_page_hit_at_3 = 0.90`，`raw_page_mrr = 0.7792`，`avg_total_retrieval_ms = 398.7145`
+- `muvera_only`: `raw_page_hit_at_3 = 0.95`，`raw_page_mrr = 0.8083`，`avg_total_retrieval_ms = 236.8545`
 
-这意味着：双路检索通过“MUVERA 轻量召回 + ColPali 精排复核”的分工设计，在工程上兼顾了可扩展性与页级定位质量。相较 `muvera_only`，它显著提升了页级命中与排序质量；但在当前 3 文档的小规模语料下，`colpali_only` 仍能以更低延迟达到相同质量。因此，当前实验更适合把两阶段检索写成“具有架构设计优势和扩展潜力的双路检索方案”，而不是“已在现配置下全面优于单阶段 ColPali 的默认策略”。
+这意味着：双路检索通过“MUVERA 单向量 FDE 粗召回 + ColPali 多向量精排复核”的分工设计，保留了更清晰的扩展架构；但当前 3 文档的小规模实验并不支持“two_stage 比 `muvera_only` 更准”的结论。更稳妥的表述是：`two_stage` 是面向更大规模语料的工程结构准备；当前同进程 benchmark 中，`two_stage` 与 `colpali_only` 的检索质量持平，`muvera_only` 的 raw Hit@3、MRR 和平均检索延迟最好。逐题诊断显示，`auto-006` 中 gold page 已进入 `two_stage` 候选集，但被 ColPali rerank 排到第 4；因此这更像是 rerank 排序策略问题，而不是 MUVERA FDE 粗召回漏召回或 Qdrant schema 错误。
 
 ### 简历 / 项目介绍表述参考
 
-如果简历里只保留 3 到 4 个指标，当前更推荐：`final_page_hit_at_3 = 90%`、`final_page_mrr = 0.7667`、`citation_has_gold_evidence_rate = 90%`、`answer_contains_gold_answer_rate = 80%`。`automatic_faithfulness = 1.00（20/20 scored）` 更适合作为补充说明，用来表达“回答基本被返回证据直接支持”，不建议单独作为 headline。
+如果简历里只保留 3 到 4 个指标，当前更推荐：`final_page_hit_at_3 = 90%`、`final_page_mrr = 0.7667`、`citation_has_gold_evidence_rate = 90%`、`answer_contains_gold_answer_rate = 85%`。`automatic_faithfulness = 1.00（20/20 scored）` 更适合作为补充说明，用来表达“回答基本被返回证据直接支持”，不建议单独作为 headline。
 
-中文：实现融合 ColPali、MUVERA 与 Qdrant 的多模态视觉 RAG 系统，支持 PDF / PPTX 文档问答、页面级证据回溯、复合问题检索与多轮上下文改写；搭建 20 题、覆盖 3 份真实文档的 benchmark，在自动评测中取得 90% final page Hit@3、0.7667 final page MRR、90% 引用命中 gold evidence 与 80% gold answer 覆盖率，并补入 20/20 scored 的 automatic faithfulness 指标，用于衡量答案是否被返回证据直接支持。
+中文：实现融合 ColPali、MUVERA 与 Qdrant 的多模态视觉 RAG 系统，支持 PDF / PPTX 文档问答、页面级证据回溯、复合问题检索与多轮上下文改写；搭建 20 题、覆盖 3 份真实文档的 benchmark，在自动评测中取得 90% final page Hit@3、0.7667 final page MRR、90% 引用命中 gold evidence 与 85% gold answer 覆盖率，并补入 20/20 scored 的 automatic faithfulness 指标，用于衡量答案是否被返回证据直接支持。
 
-English: Built a multimodal visual RAG system on top of ColPali, MUVERA, and Qdrant for PDF/PPTX question answering with page-level evidence grounding and compound-query retrieval; built a 20-question benchmark across 3 real documents, achieved 90% final page Hit@3, 0.7667 final page MRR, 90% citation-to-gold-evidence match, and 80% gold-answer coverage in automated evaluation, and added a 20/20-scored automatic faithfulness metric to measure whether answers are directly supported by returned evidence pages.
+English: Built a multimodal visual RAG system on top of ColPali, MUVERA, and Qdrant for PDF/PPTX question answering with page-level evidence grounding and compound-query retrieval; built a 20-question benchmark across 3 real documents, achieved 90% final page Hit@3, 0.7667 final page MRR, 90% citation-to-gold-evidence match, and 85% gold-answer coverage in automated evaluation, and added a 20/20-scored automatic faithfulness metric to measure whether answers are directly supported by returned evidence pages.
 
 如果你想把人工复核结论也写进去，建议单独注明样本范围，例如：在 earlier reviewed 10-question subset 上，manual answer accuracy 和 faithfulness 均为 1.0，manual citation correctness 为 0.95。这样不会把 10 题人工结果误说成 20 题人工结果。

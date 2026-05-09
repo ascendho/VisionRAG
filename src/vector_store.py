@@ -40,6 +40,22 @@ from src.config import (
 
 logger = logging.getLogger(__name__)
 
+COLPALI_VECTOR_DIM = 128
+MUVERA_K_SIM = 6
+MUVERA_DIM_PROJ = 16
+MUVERA_R_REPS = 30
+MUVERA_RANDOM_SEED = 42
+MUVERA_SCORE_SCALE = 2 ** (MUVERA_K_SIM / 2)
+
+
+def get_muvera_fde_dimension(
+    *,
+    k_sim: int = MUVERA_K_SIM,
+    dim_proj: int = MUVERA_DIM_PROJ,
+    r_reps: int = MUVERA_R_REPS,
+) -> int:
+    return int(r_reps * (2 ** k_sim) * dim_proj)
+
 
 class VisionVectorStore:
     """
@@ -59,14 +75,13 @@ class VisionVectorStore:
         # 避免开发环境中客户端与服务端小版本不完全一致时频繁报警。
         self.qdrant = self._build_qdrant_client()
         
-        # MUVERA 负责把 ColPali 的原始多向量压缩成更短的表示，主要服务第一阶段粗召回。
-        # 可以把它理解成“牺牲一点点精度，换取更快的大范围候选筛选”。
+        # MUVERA 负责把 ColPali 的原始多向量压成固定维度单向量，主要服务第一阶段粗召回。
         self.muvera = Muvera(
-            dim=128,          # ColPali 单个向量 token 的原始维度。
-            k_sim=6,          # 聚类数量控制参数，对应 2^6 = 64 个聚类中心。
-            dim_proj=16,      # 压缩后每个聚类表示的维度，用于提升第一阶段检索速度。
-            r_reps=30,        # 重复投影次数越高，近似召回通常越稳定，但计算也会略增。
-            random_seed=42,   # 固定随机种子，确保实验结果和线上行为更容易复现。
+            dim=COLPALI_VECTOR_DIM,      # ColPali 单个向量 token 的原始维度。
+            k_sim=MUVERA_K_SIM,          # 聚类数量控制参数，对应 2^6 = 64 个聚类中心。
+            dim_proj=MUVERA_DIM_PROJ,    # 每个聚类中心随机投影后的维度。
+            r_reps=MUVERA_R_REPS,        # 重复投影次数越高，近似召回通常越稳定，但计算也会略增。
+            random_seed=MUVERA_RANDOM_SEED,
         )
         
         # 按硬件能力选择运行设备：优先 CUDA，其次 Apple MPS，最后退回 CPU。
@@ -119,26 +134,74 @@ class VisionVectorStore:
         if not self.qdrant.collection_exists(COLLECTION_NAME):
             self.qdrant.create_collection(
                 collection_name=COLLECTION_NAME,
-                vectors_config={
-                    # 原始多向量：用于最终精排。
-                    # 这里使用 MAX_SIM，是因为 Late Interaction 模型通常会取 query token 与
-                    # document token 间的最佳匹配得分，再聚合成总体相关性。
-                    "original": models.VectorParams(
-                        size=128,
-                        distance=models.Distance.COSINE,
-                        multivector_config=models.MultiVectorConfig(
-                            comparator=models.MultiVectorComparator.MAX_SIM
-                        ),
-                    ),
-                    # 压缩向量：用于第一阶段快速召回，先从全库中筛出较小候选集。
-                    "muvera_fde": models.VectorParams(
-                        size=16,
-                        distance=models.Distance.DOT,
-                        multivector_config=models.MultiVectorConfig(
-                            comparator=models.MultiVectorComparator.MAX_SIM
-                        ),
-                    ),
-                }
+                vectors_config=self._build_vectors_config(),
+            )
+            return
+
+        self._validate_collection_schema()
+
+    @property
+    def muvera_fde_dimension(self) -> int:
+        return int(getattr(self.muvera, "embedding_size", get_muvera_fde_dimension()))
+
+    def _build_vectors_config(self) -> Dict[str, models.VectorParams]:
+        return {
+            "original": models.VectorParams(
+                size=COLPALI_VECTOR_DIM,
+                distance=models.Distance.COSINE,
+                multivector_config=models.MultiVectorConfig(
+                    comparator=models.MultiVectorComparator.MAX_SIM
+                ),
+            ),
+            "muvera_fde": models.VectorParams(
+                size=self.muvera_fde_dimension,
+                distance=models.Distance.DOT,
+            ),
+        }
+
+    def _get_vector_params(self, collection_info: Any, vector_name: str) -> Any:
+        config = getattr(collection_info, "config", None)
+        params = getattr(config, "params", None)
+        vectors = getattr(params, "vectors", None)
+        if isinstance(vectors, dict):
+            return vectors.get(vector_name)
+        return None
+
+    def _get_vector_param_value(self, vector_params: Any, field_name: str) -> Any:
+        if vector_params is None:
+            return None
+        if isinstance(vector_params, dict):
+            return vector_params.get(field_name)
+        return getattr(vector_params, field_name, None)
+
+    def _validate_collection_schema(self) -> None:
+        collection_info = self.qdrant.get_collection(COLLECTION_NAME)
+        original_params = self._get_vector_params(collection_info, "original")
+        muvera_params = self._get_vector_params(collection_info, "muvera_fde")
+
+        issues = []
+        original_size = self._get_vector_param_value(original_params, "size")
+        original_multivector = self._get_vector_param_value(original_params, "multivector_config")
+        if original_params is None:
+            issues.append("missing vector field 'original'")
+        elif int(original_size or 0) != COLPALI_VECTOR_DIM or original_multivector is None:
+            issues.append("vector field 'original' must be a 128-D multivector")
+
+        muvera_size = self._get_vector_param_value(muvera_params, "size")
+        muvera_multivector = self._get_vector_param_value(muvera_params, "multivector_config")
+        if muvera_params is None:
+            issues.append("missing vector field 'muvera_fde'")
+        elif int(muvera_size or 0) != self.muvera_fde_dimension or muvera_multivector is not None:
+            issues.append(
+                "vector field 'muvera_fde' must be a "
+                f"{self.muvera_fde_dimension}-D single dense vector"
+            )
+
+        if issues:
+            raise RuntimeError(
+                f"Qdrant collection {COLLECTION_NAME!r} has an incompatible vector schema: "
+                + "; ".join(issues)
+                + ". Reset and reindex the collection before querying with the MUVERA FDE pipeline."
             )
 
     def reset_collection(self):
@@ -309,9 +372,8 @@ class VisionVectorStore:
             for j, (path, original_emb) in enumerate(zip(batch_paths, cpu_embeddings)):
                 # 无论上游输出形状如何，入库前都显式重塑成“若干行 x 128 列”。
                 # 这一步的目标是确保每一行都表示一个 token 向量，便于后续多向量检索。
-                original_emb_2d = original_emb.reshape(-1, 128)
-                muvera_embRaw = self.muvera.process_document(original_emb)
-                muvera_emb_2d = muvera_embRaw.reshape(-1, 16)
+                original_emb_2d = np.asarray(original_emb, dtype=np.float32).reshape(-1, COLPALI_VECTOR_DIM)
+                muvera_fde = self._encode_muvera_document(original_emb_2d)
                 
                 # 页码从 1 开始，和用户看到的文档页概念保持一致。
                 page_number = i + j + 1
@@ -319,7 +381,7 @@ class VisionVectorStore:
                     id=self._make_point_id(document_id=document_id, page_number=page_number),
                     vector={
                         "original": original_emb_2d.tolist(),
-                        "muvera_fde": muvera_emb_2d.tolist(),
+                        "muvera_fde": muvera_fde.tolist(),
                     },
                     payload={
                         "image_path": path,
@@ -478,7 +540,7 @@ class VisionVectorStore:
         batch_queries = self.processor.process_queries([query_text]).to(self.device)
         with torch.no_grad():
             query_embedding_tensor = self.model(**batch_queries)[0]
-        query_embeddings = query_embedding_tensor.float().cpu().numpy().reshape(-1, 128)
+        query_embeddings = query_embedding_tensor.float().cpu().numpy().reshape(-1, COLPALI_VECTOR_DIM)
         return np.asarray(query_embeddings, dtype=np.float32)
 
     def _load_original_vectors_for_page(self, document_id: str, page_number: int) -> Optional[np.ndarray]:
@@ -531,7 +593,7 @@ class VisionVectorStore:
         if original_array.size == 0:
             return None
         if original_array.ndim == 1:
-            original_array = original_array.reshape(-1, 128)
+            original_array = original_array.reshape(-1, COLPALI_VECTOR_DIM)
         return original_array
 
     def _score_query_against_document_embeddings(
@@ -594,21 +656,39 @@ class VisionVectorStore:
         batch_queries = self.processor.process_queries([query_text]).to(self.device)
         with torch.no_grad():
             query_embedding_tensor = self.model(**batch_queries)[0]
-        return query_embedding_tensor.float().cpu().numpy().reshape(-1, 128)
+        return query_embedding_tensor.float().cpu().numpy().reshape(-1, COLPALI_VECTOR_DIM)
+
+    def _validate_muvera_fde(self, fde: np.ndarray, vector_kind: str) -> np.ndarray:
+        fde_1d = np.asarray(fde, dtype=np.float32).reshape(-1)
+        if fde_1d.shape[0] != self.muvera_fde_dimension:
+            raise ValueError(
+                f"MUVERA {vector_kind} FDE has dimension {fde_1d.shape[0]}, "
+                f"expected {self.muvera_fde_dimension}."
+            )
+        return fde_1d
+
+    def _encode_muvera_document(self, document_colpali_2d: np.ndarray) -> np.ndarray:
+        return self._validate_muvera_fde(
+            self.muvera.process_document(document_colpali_2d),
+            "document",
+        )
 
     def _encode_muvera_query(self, query_colpali_2d: np.ndarray) -> np.ndarray:
-        return self.muvera.process_query(query_colpali_2d).reshape(-1, 16)
+        return self._validate_muvera_fde(
+            self.muvera.process_query(query_colpali_2d),
+            "query",
+        )
 
     def _format_query_results(
         self,
         points: List[Any],
         *,
         top_k: int,
-        score_normalizer: int,
+        score_normalizer: float,
     ) -> List[Dict[str, Any]]:
         unique = []
         seen = set()
-        normalized_score_divisor = max(int(score_normalizer), 1)
+        normalized_score_divisor = max(float(score_normalizer), 1.0)
         for point in points:
             payload = point.payload or {}
             key = (
@@ -664,11 +744,10 @@ class VisionVectorStore:
 
         total_start = time.perf_counter()
         query_colpali_2d: Optional[np.ndarray] = None
-        query_muvera_2d: Optional[np.ndarray] = None
+        query_muvera_fde: Optional[np.ndarray] = None
         colpali_query_embedding_ms = 0.0
         muvera_query_embedding_ms = 0.0
         colpali_query_token_count = 1
-        muvera_query_token_count = 1
 
         query_embedding_start = time.perf_counter()
         query_colpali_2d = self._encode_colpali_query(query_text)
@@ -677,9 +756,8 @@ class VisionVectorStore:
 
         if resolved_mode in {"two_stage", "muvera_only"}:
             muvera_query_start = time.perf_counter()
-            query_muvera_2d = self._encode_muvera_query(query_colpali_2d)
+            query_muvera_fde = self._encode_muvera_query(query_colpali_2d)
             muvera_query_embedding_ms = (time.perf_counter() - muvera_query_start) * 1000
-            muvera_query_token_count = max(query_muvera_2d.shape[0], 1)
 
         query_embedding_ms = colpali_query_embedding_ms + muvera_query_embedding_ms
 
@@ -687,11 +765,13 @@ class VisionVectorStore:
 
         qdrant_query_start = time.perf_counter()
         if resolved_mode == "two_stage":
+            if query_muvera_fde is None:
+                raise RuntimeError("MUVERA query FDE was not generated for two_stage retrieval.")
             results = self.qdrant.query_points(
                 collection_name=COLLECTION_NAME,
                 prefetch=[
                     models.Prefetch(
-                        query=query_muvera_2d.tolist(),
+                        query=query_muvera_fde.tolist(),
                         using="muvera_fde",
                         limit=top_k * prefetch_multiplier,
                     )
@@ -716,15 +796,17 @@ class VisionVectorStore:
             score_space = "colpali_original"
             prefetch_limit = 0
         else:
+            if query_muvera_fde is None:
+                raise RuntimeError("MUVERA query FDE was not generated for muvera_only retrieval.")
             results = self.qdrant.query_points(
                 collection_name=COLLECTION_NAME,
-                query=query_muvera_2d.tolist(),
+                query=query_muvera_fde.tolist(),
                 using="muvera_fde",
                 limit=top_k,
                 query_filter=query_filter,
             )
-            score_normalizer = muvera_query_token_count
-            score_space = "muvera_fde"
+            score_normalizer = colpali_query_token_count * MUVERA_SCORE_SCALE
+            score_space = "muvera_fde_single"
             prefetch_limit = 0
         qdrant_query_ms = (time.perf_counter() - qdrant_query_start) * 1000
 
@@ -744,6 +826,7 @@ class VisionVectorStore:
             "prefetch_limit": prefetch_limit,
             "returned_points": len(unique),
             "score_space": score_space,
+            "muvera_fde_dimension": self.muvera_fde_dimension,
         }
         logger.info(
             "retrieval_timing mode=%s total_retrieval_ms=%.2f qdrant_query_ms=%.2f query_embedding_ms=%.2f colpali_query_embedding_ms=%.2f muvera_query_embedding_ms=%.2f result_format_ms=%.2f top_k=%s prefetch_limit=%s",
