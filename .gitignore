@@ -18,6 +18,10 @@ env/
 __pycache__/
 *.pyc
 
+# 本地私有面试材料（仅保留本地，不进入版本库）
+docs/interview_project_faq.md
+docs/interview_project_script.md
+
 # macOS 系统缓存
 .DS_Store
 .AppleDouble
